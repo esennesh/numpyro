@@ -20,10 +20,21 @@ classifiers = [
 ]
 keywords = ["bayesian", "machine learning", "probabilistic", "statistics"]
 dependencies = [
+    "funsor>=0.4.7",
+    "ipython>=9.15.0",
     "jax>=0.7.0",
     "jaxlib>=0.7.0",
     "multipledispatch",
+    "nbsphinx>=0.9.8",
     "numpy",
+    "pandoc>=2.4",
+    "readthedocs-sphinx-search>=0.3.2",
+    "ruff>=0.15.20",
+    "sphinx>=9.0.4",
+    "sphinx-gallery>=0.21.0",
+    "sphinx-rtd-theme>=3.1.0",
+    "sphinxcontrib-jquery>=4.1",
+    "tfp-nightly>=0.26.0.dev20260630",
     "tqdm",
 ]
 
