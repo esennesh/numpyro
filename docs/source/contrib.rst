@@ -115,7 +115,7 @@ described in [1] and [2].
 .. warning::
     This module is experimental.
 
-**Why do we need an approximation?** 
+**Why do we need an approximation?**
 
 Gaussian processes do not scale well with the number of data points. Recall we had to invert the kernel matrix!
 The computational complexity of the Gaussian process model is :math:`\mathcal{O}(n^3)`, where :math:`n` is the number of data
@@ -143,8 +143,8 @@ Let :math:`m^\star = \prod_{d=1}^D m_d` be the total number of terms of the appr
 
 .. math::
 
-    f(x) \approx \sum_{j = 1}^{m^\star} 
-    \overbrace{\color{red}{\left(S(\sqrt{\boldsymbol{\lambda}_j})\right)^{1/2}}}^{\text{all hyperparameters are here!}} 
+    f(x) \approx \sum_{j = 1}^{m^\star}
+    \overbrace{\color{red}{\left(S(\sqrt{\boldsymbol{\lambda}_j})\right)^{1/2}}}^{\text{all hyperparameters are here!}}
     \times
     \underbrace{\color{blue}{\phi_{j}(\boldsymbol{x})}}_{\text{easy to compute!}}
     \times
@@ -325,3 +325,93 @@ hsgp_rational_quadratic
 hsgp_periodic_non_centered
 --------------------------
 .. autofunction:: numpyro.contrib.hsgp.approximation.hsgp_periodic_non_centered
+
+
+Diagonalisation SGD
+~~~~~~~~~~~~~~~~~~~
+
+``numpyro.contrib.diag_sgd`` implements Diagonalisation SGD (DSGD) [1], a program
+transformation that makes models with discrete latent variables amenable to
+reparameterisation-gradient optimisation. Each discrete sample site is replaced
+by a smooth inverse-CDF reparameterisation controlled by a temperature
+:math:`\eta`; as :math:`\eta \to 0` the smoothed objective converges to the
+original one, and [1] (Theorem 5.6) gives an :math:`\eta`-schedule under which the
+DSGD gradient estimator converges almost surely to stationary points.
+
+Unbounded families (Poisson, Geometric, GammaPoisson / NegativeBinomial, and
+their zero-inflated wrappers) are smoothed in *value space*: the CDF is convolved
+with a logistic kernel, :math:`Q_{\eta}(z) = \sum_k q(k)\,\sigma_{\eta}(z-k)`, which is
+the CDF of :math:`\sum_k q(k)\,\mathrm{Logistic}(k, \eta)`. Because the terms are
+weighted by the pmf, this needs no support truncation: evaluation uses only a
+small window of integers around :math:`z` plus the closed-form bulk CDF, the
+Lipschitz constant is bounded by :math:`\frac{1}{4\eta}` independent of the support
+size, and sampling inverts :math:`Q_{\eta}` by bracketed bisection with an
+implicit-function-theorem gradient. Finite-support families use the grid
+inverse-CDF :class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform`.
+
+Typical usage anneals :math:`\\eta` over training::
+
+    from numpyro.contrib.diag_sgd import dsgd, count_layers, eta_schedule
+
+    smoothed_model = dsgd(model)
+    ell = count_layers(model, *example_args)
+    schedule = eta_schedule(K=num_steps, ell=ell, eta_final=0.01)
+    for k in range(num_steps):
+        eta = schedule[k]
+        # use smoothed_model(eta, *args) inside your SVI / ELBO step
+
+**References**
+
+1. Wagner, D., Khajwal, B. & Ong, L. *Diagonalisation SGD: Fast & Convergent SGD
+for Non-Differentiable Models via Reparameterisation and Smoothing.* in
+Proceedings of the 27th International Conference on Artificial Intelligence and
+Statistics 1801–1809 (PMLR, 2024).
+
+dsgd
+----
+.. autofunction:: numpyro.contrib.diag_sgd.dsgd
+
+count_layers
+------------
+.. autofunction:: numpyro.contrib.diag_sgd.count_layers
+
+eta_schedule
+------------
+.. autofunction:: numpyro.contrib.diag_sgd.eta_schedule
+
+SmoothedDiscrete
+----------------
+.. autofunction:: numpyro.contrib.diag_sgd.SmoothedDiscrete
+
+WindowedSmoothICDFTransform
+---------------------------
+.. autoclass:: numpyro.contrib.diag_sgd.WindowedSmoothICDFTransform
+    :members:
+    :show-inheritance:
+    :member-order: bysource
+
+SmoothICDFTransform
+-------------------
+.. autoclass:: numpyro.contrib.diag_sgd.SmoothICDFTransform
+    :members:
+    :show-inheritance:
+    :member-order: bysource
+
+StraightThroughSmoothed
+-----------------------
+.. autoclass:: numpyro.contrib.diag_sgd.StraightThroughSmoothed
+    :members:
+    :show-inheritance:
+    :member-order: bysource
+
+smooth_cond
+-----------
+.. autofunction:: numpyro.contrib.diag_sgd.smooth_cond
+
+smooth_switch
+-------------
+.. autofunction:: numpyro.contrib.diag_sgd.smooth_switch
+
+smooth_icdf
+-----------
+.. autofunction:: numpyro.contrib.diag_sgd.smooth_icdf
