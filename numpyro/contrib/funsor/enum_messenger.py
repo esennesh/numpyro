@@ -562,8 +562,16 @@ class plate(GlobalNamedMessenger):
 
 class enum(BaseEnumMessenger):
     """
-    Enumerates in parallel over discrete sample sites marked
+    Enumerates in parallel over sample sites marked
     ``infer={"enumerate": "parallel"}``.
+
+    By default a site is enumerated exhaustively over the support of its
+    distribution (which must therefore satisfy ``.has_enumerate_support``). If the
+    site additionally sets ``infer={"num_samples": K}``, it is instead handled by
+    drawing ``K`` Monte Carlo samples along a fresh named dimension -- the basis of
+    massively parallel importance weighting / Tensor Monte Carlo (Aitchison, 2019;
+    Bowyer et al., 2024). Sampled enumeration works for continuous as well as discrete
+    sites, since no enumeration of the support is required.
 
     :param callable fn: Python callable with NumPyro primitives.
     :param int first_available_dim: The first tensor dimension (counting
@@ -579,18 +587,19 @@ class enum(BaseEnumMessenger):
             or msg["is_observed"]
             or msg["infer"].get("expand", False)
             or msg["infer"].get("enumerate") != "parallel"
-            or (not msg["fn"].has_enumerate_support)
         ):
             if msg["type"] == "control_flow":
                 msg["kwargs"]["enum"] = True
                 msg["kwargs"]["first_available_dim"] = self.first_available_dim
             return super().process_message(msg)
 
-        if msg["infer"].get("num_samples", None) is not None:
-            raise NotImplementedError("TODO implement multiple sampling")
+        num_samples = msg["infer"].get("num_samples", None)
+        if num_samples is not None:
+            self._enumerate_by_sampling(msg, num_samples)
+            return
 
-        if msg["infer"].get("expand", False):
-            raise NotImplementedError("expand=True not implemented")
+        if not msg["fn"].has_enumerate_support:
+            return super().process_message(msg)
 
         size = msg["fn"].enumerate_support(expand=False).shape[0]
         raw_value = jnp.arange(0, size)
@@ -598,6 +607,38 @@ class enum(BaseEnumMessenger):
             raw_value, OrderedDict([(msg["name"], funsor.Bint[size])]), size
         )
 
+        msg["value"] = to_data(funsor_value)
+        msg["done"] = True
+
+    def _enumerate_by_sampling(self, msg, num_samples):
+        """Draw ``num_samples`` samples of a site along a fresh named dimension.
+
+        The leading axis of the drawn samples becomes this site's sample-index ("K")
+        dimension, named after the site. The remaining batch axes are already-named
+        dimensions -- enclosing plates and any upstream sample-index dimensions
+        inherited through the distribution's parameters (the parent coupling that makes
+        a child factor range over ``K**(1 + #parents)`` values). Their names are read
+        from the global :class:`DimStack`; unnamed size-1 batch axes carry no
+        information and are squeezed so the remaining axes align with ``inputs``.
+        """
+        fn = msg["fn"]
+        rng_key = msg["kwargs"]["rng_key"]
+        samples = fn.sample(rng_key, (num_samples,))  # (K,) + batch + event
+
+        batch_ndim = len(fn.batch_shape)
+        batch_dim_to_name = self._get_dim_to_name(fn.batch_shape)
+        inputs = OrderedDict([(msg["name"], funsor.Bint[num_samples])])
+        squeeze_axes = []
+        for dim in range(-batch_ndim, 0):
+            if dim in batch_dim_to_name:
+                inputs[batch_dim_to_name[dim]] = funsor.Bint[fn.batch_shape[dim]]
+            else:
+                assert fn.batch_shape[dim] == 1
+                squeeze_axes.append(dim - fn.event_dim)
+        if squeeze_axes:
+            samples = jnp.squeeze(samples, axis=tuple(squeeze_axes))
+
+        funsor_value = funsor.Tensor(samples, inputs)
         msg["value"] = to_data(funsor_value)
         msg["done"] = True
 
