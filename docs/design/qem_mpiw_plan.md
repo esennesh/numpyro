@@ -255,6 +255,30 @@ model (no gradients through samples are ever needed, so discrete sites are suppo
 naturally); K-dim/plate interaction; memory scaling sanity (factor size
 O(K^(1+#parents)) × plates, paper §6).
 
+**Alternate low-memory computation path (to provide, not just "later").** The default
+contraction materializes each factor densely (up to K^(1+#parents) × plates) and the
+sum-product's peak intermediate is ~K^(treewidth+1) — this is what bounds usable K.
+We should also offer a memory-frugal path that materializes as little as possible and
+instead spends serial compute: loop over the index-tuples k of the summed K-dims
+(and/or plate elements) with `jax.lax.scan`/`fori_loop`, accumulating the log-marginal
+via running logsumexp and the source-term gradients per index, so that at no point is a
+full K^(1+#parents) (let alone K^treewidth) array resident — only O(per-iteration
+slice) memory, at the cost of many sequential steps. Design points to settle:
+- Granularity: loop over the single largest K-dim (or the treewidth-inducing set) while
+  keeping smaller dims vectorized — a tunable time/memory trade, not all-or-nothing.
+- Keep the source-term trick working: either differentiate the scanned accumulator, or
+  accumulate per-index contributions to the weights directly (the running-logsumexp
+  normalizer is known at the end, so weights can be finalized in a second pass or via a
+  carried normalizer).
+- Same public results as the dense path (identical `log_marginal`/`moments` to
+  numerical tolerance) — make it a `backend`/`memory_budget` switch on the contraction
+  API, with the dense funsor path as default and this as the fallback for large K or
+  high treewidth. The hand-rolled log-space einsum fallback (above) and this frugal
+  path share machinery.
+- Complements the paper's own remedies (Aitchison-style plate factorization we already
+  get, plus "grouping" and "chunking", §6); this is the chunking taken to its serial
+  limit.
+
 **Bird-occupancy integration test** (small scale): a mixed continuous-discrete
 hierarchical model from the paper's lineage (Bowyer 2024) — binary per-site presence
 latents + hierarchical continuous occupancy/detection params. Because the binary
