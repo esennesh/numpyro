@@ -33,17 +33,21 @@ from numpyro.handlers import infer_config, replay, seed, trace as orig_trace
 funsor.set_backend("jax")
 
 
-def _squeeze_fillers(arr, dim_to_name):
+def _squeeze_fillers(arr, dim_to_name, event_dim=0):
     """Drop size-1 axes that are neither the site's K dimension nor a plate.
 
     The global dim allocator leaves a site's array with size-1 filler axes at the
     positions of *other* sites' K dimensions. These carry no information; squeezing
-    them yields the natural ``(K, *plates)`` shape. Assumes a scalar-event site
-    (``dim_to_name`` positions index the whole array).
+    them yields the natural ``(K, *plates[, *event])`` shape.
+
+    ``dim_to_name`` positions index the *batch* region (event dims excluded, as in the
+    trace), so with ``event_dim`` trailing event axes they map to batch axes
+    ``batch_ndim + d``. Event axes are always preserved.
     """
     ndim = jnp.ndim(arr)
-    keep = {ndim + d for d in dim_to_name}  # negative position -> axis index
-    drop = tuple(j for j in range(ndim) if j not in keep and arr.shape[j] == 1)
+    batch_ndim = ndim - event_dim
+    keep = {batch_ndim + d for d in dim_to_name}  # batch position -> axis index
+    drop = tuple(j for j in range(batch_ndim) if j not in keep and arr.shape[j] == 1)
     return jnp.squeeze(arr, axis=drop) if drop else arr
 
 
@@ -68,6 +72,7 @@ class _SiteInfo(NamedTuple):
     guide_value: Any
     guide_log_prob: Any
     guide_dim_to_name: Any
+    guide_event_dim: int
 
 
 class _Prepared(NamedTuple):
@@ -134,14 +139,22 @@ class MPIW:
             m_lp = msite["fn"].log_prob(msite["value"])
             all_names.update(m_d2n.values())
             if msite["is_observed"] or name not in guide_trace:
-                sites[name] = _SiteInfo(True, m_lp, m_d2n, None, None, None)
+                sites[name] = _SiteInfo(True, m_lp, m_d2n, None, None, None, 0)
             else:
                 gsite = guide_trace[name]
                 g_d2n = gsite["infer"]["dim_to_name"]
                 g_lp = gsite["fn"].log_prob(gsite["value"])
                 all_names.update(g_d2n.values())
                 eliminate.add(name)
-                sites[name] = _SiteInfo(False, m_lp, m_d2n, gsite["value"], g_lp, g_d2n)
+                sites[name] = _SiteInfo(
+                    False,
+                    m_lp,
+                    m_d2n,
+                    gsite["value"],
+                    g_lp,
+                    g_d2n,
+                    gsite["fn"].event_dim,
+                )
 
         plates = frozenset(all_names) - frozenset(eliminate)
         return _Prepared(sites, frozenset(eliminate), plates, float(jnp.log(K)))
@@ -193,9 +206,11 @@ class MPIW:
         )
         result = {}
         for name in source_shapes:
-            d2n = prep.sites[name].guide_dim_to_name
-            value = _squeeze_fillers(prep.sites[name].guide_value, d2n)
-            weight = _squeeze_fillers(weights[name], d2n)
+            s = prep.sites[name]
+            d2n = s.guide_dim_to_name
+            # the value carries trailing event axes; the source-term weight is batch-only
+            value = _squeeze_fillers(s.guide_value, d2n, s.guide_event_dim)
+            weight = _squeeze_fillers(weights[name], d2n, 0)
             result[name] = (value, weight)
         return result
 
