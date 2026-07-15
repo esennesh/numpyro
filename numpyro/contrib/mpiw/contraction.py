@@ -76,12 +76,17 @@ def contract_log_marginal(
         ``log p(z_i | parents) - log q(z_i | parents) - log K`` (the ``- log K``
         implementing the uniform ``1 / K**n`` average over sample combinations), and
         for each observed site the model log density ``log p(x | parents)``.
+    :param factors: each item is either a :class:`NamedFactor` or, for factors produced
+        directly from a traced model, a :class:`funsor.Funsor` already carrying named
+        inputs.
     :param eliminate: names of the sample-index ("K") dimensions to sum out.
     :param plates: names of plate dimensions (a subset of the dimensions appearing in
         ``factors``); these are reduced as products, not sums.
     :returns: the scalar ``log P_MP(x)``.
     """
-    funsor_factors = [f.to_funsor() for f in factors]
+    funsor_factors = [
+        f.to_funsor() if isinstance(f, NamedFactor) else f for f in factors
+    ]
     with funsor.interpretations.lazy:
         lazy = funsor.sum_product.sum_product(
             funsor.ops.logaddexp,

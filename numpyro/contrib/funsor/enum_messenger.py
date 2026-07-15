@@ -595,7 +595,12 @@ class enum(BaseEnumMessenger):
 
         num_samples = msg["infer"].get("num_samples", None)
         if num_samples is not None:
-            self._enumerate_by_sampling(msg, num_samples)
+            # A replayed/conditioned site already carries a value (and, via replay,
+            # a copied num_samples in its infer dict); do not resample it -- unlike
+            # exhaustive enumeration, resampling is not idempotent and would discard
+            # the provided value.
+            if msg["value"] is None:
+                self._enumerate_by_sampling(msg, num_samples)
             return
 
         if not msg["fn"].has_enumerate_support:
