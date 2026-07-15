@@ -25,8 +25,8 @@ The resulting figure has three panels:
 
 1. MPIW ``log P_MP(x)`` (mean +/- standard error over seeds) converging to the exact
    log marginal likelihood as ``K`` grows.
-2. Absolute error of the MPIW posterior means of the two logits vs. the exact grid,
-   with the (small) NUTS error shown for reference.
+2. MPIW posterior means of the two logits (mean +/- standard deviation over the same
+   array of seeds) converging to the exact grid values, with NUTS shown for reference.
 3. Wall-clock time per estimate for the dense vs. serial contraction, vs. ``K``.
 
 **References:**
@@ -155,23 +155,27 @@ def main(args):
 
     Ks = args.num_samples_grid
     lm_mean, lm_se = [], []
-    err_lpsi, err_lp = [], []
+    lpsi_mean, lpsi_std, lp_mean, lp_std = [], [], [], []
     t_dense, t_serial = [], []
     for K in Ks:
         mpiw = MPIW(model, guide, num_samples=K)
+        # the same array of seeds drives both the log-marginal and the moment estimates
+        keys = random.split(random.key(args.seed), args.num_seeds)
 
         # log marginal likelihood: mean +/- standard error over seeds
-        keys = random.split(random.key(args.seed), args.num_seeds)
         lms = np.array([float(mpiw.log_marginal(k, Y)) for k in keys])
         lm_mean.append(lms.mean())
         lm_se.append(lms.std() / np.sqrt(len(lms)))
 
-        # posterior means of the logits (absolute error vs the exact grid)
-        m = mpiw.moments(
-            random.key(args.seed), {"lpsi": lambda v: v, "lp": lambda v: v}, Y
-        )
-        err_lpsi.append(abs(float(m["lpsi"]) - exact_lpsi))
-        err_lp.append(abs(float(m["lp"]) - exact_lp))
+        # posterior means of the logits: mean +/- standard deviation over the same seeds
+        stats = {"lpsi": lambda v: v, "lp": lambda v: v}
+        est = [mpiw.moments(k, stats, Y) for k in keys]
+        est_lpsi = np.array([float(e["lpsi"]) for e in est])
+        est_lp = np.array([float(e["lp"]) for e in est])
+        lpsi_mean.append(est_lpsi.mean())
+        lpsi_std.append(est_lpsi.std())
+        lp_mean.append(est_lp.mean())
+        lp_std.append(est_lp.std())
 
         # dense vs serial contraction timing (identical values)
         key = random.key(args.seed)
@@ -179,7 +183,10 @@ def main(args):
         t_serial.append(
             _timed(lambda: mpiw.log_marginal(key, Y, serial_sites=("lpsi", "lp")))
         )
-        print(f"K={K:4d}: logP_MP={lm_mean[-1]:.3f}  err(lpsi)={err_lpsi[-1]:.3f}")
+        print(
+            f"K={K:4d}: logP_MP={lm_mean[-1]:.3f}  "
+            f"E[lpsi]={lpsi_mean[-1]:.3f}+/-{lpsi_std[-1]:.3f}"
+        )
 
     fig, (ax1, ax2, ax3) = plt.subplots(
         1, 3, figsize=(15, 4.5), constrained_layout=True
@@ -197,20 +204,35 @@ def main(args):
     )
     ax1.legend()
 
-    ax2.plot(Ks, err_lpsi, marker="o", color="C0", label="MPIW |E[lpsi]-exact|")
-    ax2.plot(Ks, err_lp, marker="s", color="C1", label="MPIW |E[lp]-exact|")
-    ax2.axhline(
-        abs(nuts_lpsi - exact_lpsi), color="C0", ls=":", label="NUTS |lpsi err|"
+    ax2.errorbar(
+        Ks,
+        lpsi_mean,
+        yerr=lpsi_std,
+        marker="o",
+        color="C0",
+        capsize=3,
+        label="MPIW E[lpsi]",
     )
-    ax2.axhline(abs(nuts_lp - exact_lp), color="C1", ls=":", label="NUTS |lp err|")
+    ax2.errorbar(
+        Ks,
+        lp_mean,
+        yerr=lp_std,
+        marker="s",
+        color="C1",
+        capsize=3,
+        label="MPIW E[lp]",
+    )
+    ax2.axhline(exact_lpsi, color="C0", ls="--", label="exact lpsi")
+    ax2.axhline(exact_lp, color="C1", ls="--", label="exact lp")
+    ax2.axhline(nuts_lpsi, color="C0", ls=":", alpha=0.7, label="NUTS lpsi")
+    ax2.axhline(nuts_lp, color="C1", ls=":", alpha=0.7, label="NUTS lp")
     ax2.set(
         xscale="log",
-        yscale="log",
         xlabel="K (samples per latent)",
-        ylabel="absolute error",
-        title="Posterior-mean accuracy",
+        ylabel="posterior mean",
+        title="Posterior-mean estimates (mean +/- std over seeds)",
     )
-    ax2.legend()
+    ax2.legend(ncol=2, fontsize=8)
 
     ax3.plot(Ks, np.array(t_dense) * 1e3, marker="o", color="C2", label="dense")
     ax3.plot(Ks, np.array(t_serial) * 1e3, marker="s", color="C3", label="serial")
@@ -235,7 +257,7 @@ if __name__ == "__main__":
         "--num-samples-grid",
         nargs="+",
         type=int,
-        default=[3, 10, 30, 100, 300],
+        default=[3, 6, 10, 30, 60, 100, 300, 600, 1000],
         help="values of K (samples per latent) to sweep",
     )
     parser.add_argument(
