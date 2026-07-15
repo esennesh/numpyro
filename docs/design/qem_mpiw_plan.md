@@ -121,18 +121,29 @@ strategy}` site annotations for API parity, and keeps zero dependencies beyond w
 `contrib.funsor` already requires. No QEM- or exponential-family-specific code
 anywhere in this branch.
 
-**Progress:**
+**Progress: branch 3 core complete** (branch `feature/mpiw`, all green + ruff clean):
 
-- ✅ **Contraction core** — `numpyro/contrib/mpiw/contraction.py` (branch
-  `feature/mpiw`). `NamedFactor` (array + dim-name labels), `contract_log_marginal`
-  (log-space sum-product → scalar `log P_MP`, plates as product dims), and
-  `contract_with_source_terms` (source-term trick via `jax.value_and_grad` → per-site
-  normalized weights). Messenger-independent interface (factors in, scalar/weights out).
-  Tested in `test/contrib/mpiw/test_contraction.py` against both analytic models from
-  the spike (6 tests: log-marginal unbiasedness, moment recovery, per-plate-element
-  weight normalization, jit, error on un-eliminated dim). All green; ruff clean.
-- ⏳ Next: sampled-enumeration messenger (component 1), then the trace→factors builder
-  (component 2) that feeds this core, then the public `MPIW` API (component 4).
+- ✅ **Contraction core** — `numpyro/contrib/mpiw/contraction.py`. `NamedFactor`,
+  `contract_log_marginal` (log-space sum-product → `log P_MP`, plates as product dims),
+  `contract_with_source_terms` (source-term trick via `jax.value_and_grad`).
+- ✅ **Sampled enumeration messenger** — filled the `num_samples` TODO in
+  `contrib/funsor/enum_messenger.py`; draws K samples per site along a fresh named dim,
+  with parent coupling (K^(1+#parents)); works for continuous and discrete sites.
+- ✅ **End-to-end `MPIW` driver** — `numpyro/contrib/mpiw/core.py`: `log_marginal`,
+  `site_weights`, `moments`, `sample_posterior` (FFBS via funsor adjoint; recovers joint
+  covariance). Handles scalar + multivariate (event-dim) guide sites, plated/unplated,
+  continuous + discrete latents.
+- ✅ **Serial (memory-frugal) contraction** — `serial_dims`/`serial_sites` option:
+  `lax.scan` over a chosen global dim, slicing it out per iteration; differentiable
+  (source-term moments stay memory-bounded); non-plated dims only (validated). Identical
+  results to the dense path.
+- ✅ **Validation** — analytic linear-Gaussian (conjugate chain + plated hierarchical),
+  discrete latents, multivariate sites, and the bird-occupancy integration test vs an
+  exact 2D grid and NUTS on the discrete-marginalized model (config_enumerate+NUTS gold
+  standard), exercising the serial path. Tests in `test/contrib/mpiw/`.
+- ⏳ Remaining niceties: vectorize `sample_posterior` over draws (currently a sequential
+  loop); event-dim-aware behavior for statistics beyond the mean; the fully hand-rolled
+  einsum fallback (only if funsor becomes a problem).
 
 **Components:**
 
