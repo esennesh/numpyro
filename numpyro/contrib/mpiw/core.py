@@ -23,7 +23,9 @@ from jax import random
 import jax.numpy as jnp
 
 import funsor
+import funsor.adjoint
 from numpyro.contrib.funsor import enum, plate_to_enum_plate, trace as packed_trace
+from numpyro.contrib.funsor.discrete import _get_support_value
 from numpyro.contrib.mpiw.contraction import (
     contract_log_marginal,
     contract_with_source_terms,
@@ -230,3 +232,80 @@ class MPIW:
             w_b = w.reshape(w.shape + (1,) * (jnp.ndim(stat) - jnp.ndim(w)))
             out[name] = jnp.sum(w_b * stat, axis=0)
         return out
+
+    def sample_posterior(self, rng_key, num_samples, *args, **kwargs):
+        """Draw joint posterior samples of the latents.
+
+        Uses forward-filter backward-sample over the contracted importance-weight
+        factor graph (funsor adjoint under a Monte Carlo interpretation): each draw
+        picks, for every latent site, one of its ``K`` samples with probability
+        proportional to the massively parallel importance weights, respecting the
+        graphical coupling between sites (so the joint -- not merely the marginals -- is
+        sampled correctly).
+
+        All draws come from a single set of ``K`` guide samples, so the sample resolves
+        the true posterior only as well as that grid does (improving with ``K``).
+
+        .. note:: Draws are currently produced by a Python loop of ``num_samples``
+            sequential backward-sampling passes; drawing many samples is therefore
+            slow. Vectorizing over draws is a future improvement.
+
+        :param int num_samples: number of joint draws to return.
+        :returns: ``{site: draws}`` where ``draws`` has shape
+            ``(num_samples, *plates[, *event])``.
+        """
+        grid_key, draw_key = random.split(rng_key)
+        prep = self._prepare(grid_key, *args, **kwargs)
+
+        # build factors once; keep a handle to each latent's measure factor and a funsor
+        # view of its K samples (K dimension + plates in, event as output) for gathering.
+        factors = []
+        measures = {}
+        value_funsors = {}
+        plate_name_to_dim = {}
+        for name, s in prep.sites.items():
+            model_factor = funsor.to_funsor(
+                s.model_log_prob, output=funsor.Real, dim_to_name=s.model_dim_to_name
+            )
+            if s.is_observed:
+                factors.append(model_factor)
+                continue
+            guide_factor = funsor.to_funsor(
+                s.guide_log_prob, output=funsor.Real, dim_to_name=s.guide_dim_to_name
+            )
+            factor = model_factor - guide_factor - prep.log_num_samples
+            factors.append(factor)
+            measures[name] = factor
+            event_shape = jnp.shape(s.guide_value)[
+                jnp.ndim(s.guide_value) - s.guide_event_dim :
+            ]
+            output = funsor.Reals[event_shape] if s.guide_event_dim else funsor.Real
+            value_funsors[name] = funsor.to_funsor(
+                s.guide_value, output=output, dim_to_name=s.guide_dim_to_name
+            )
+            plate_name_to_dim[name] = OrderedDict(
+                (nm, dm) for dm, nm in s.guide_dim_to_name.items() if nm != name
+            )
+
+        with funsor.interpretations.lazy:
+            log_marginal = funsor.sum_product.sum_product(
+                funsor.ops.logaddexp,
+                funsor.ops.add,
+                factors,
+                eliminate=prep.eliminate | prep.plates,
+                plates=prep.plates,
+            )
+
+        draws = {name: [] for name in measures}
+        for key in random.split(draw_key, num_samples):
+            with funsor.montecarlo.MonteCarlo(rng_key=key):
+                adjoint_factors = funsor.adjoint.adjoint(
+                    funsor.ops.logaddexp, funsor.ops.add, log_marginal
+                )
+            for name in measures:
+                index = _get_support_value(adjoint_factors[measures[name]], name)
+                sampled = value_funsors[name](**{name: index})
+                draws[name].append(
+                    funsor.to_data(sampled, name_to_dim=plate_name_to_dim[name])
+                )
+        return {name: jnp.stack(d) for name, d in draws.items()}
