@@ -222,12 +222,18 @@ def main(args):
         capsize=3,
         label="MPIW E[lp]",
     )
+    # exact values as horizontal reference lines spanning the sweep; NUTS as distinct
+    # star markers placed just to the right (a star sitting on the line shows agreement,
+    # while remaining visually separable from the line).
     ax2.axhline(exact_lpsi, color="C0", ls="--", label="exact lpsi")
     ax2.axhline(exact_lp, color="C1", ls="--", label="exact lp")
-    ax2.axhline(nuts_lpsi, color="C0", ls=":", alpha=0.7, label="NUTS lpsi")
-    ax2.axhline(nuts_lp, color="C1", ls=":", alpha=0.7, label="NUTS lp")
+    x_nuts = Ks[-1] * 2.2
+    ax2.plot(x_nuts, nuts_lpsi, marker="*", ms=15, ls="", color="C0", label="NUTS lpsi")
+    ax2.plot(x_nuts, nuts_lp, marker="*", ms=15, ls="", color="C1", label="NUTS lp")
+    ax2.axvline(Ks[-1] * 1.45, color="0.8", lw=1, zorder=0)
     ax2.set(
         xscale="log",
+        xlim=(Ks[0] * 0.7, x_nuts * 1.4),
         xlabel="K (samples per latent)",
         ylabel="posterior mean",
         title="Posterior-mean estimates (mean +/- std over seeds)",
