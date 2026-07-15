@@ -16,8 +16,10 @@ from numpyro.contrib.mpiw.contraction import (
     contract_log_marginal,
     contract_with_source_terms,
 )
+from numpyro.contrib.mpiw.core import MPIW
 
 __all__ = [
+    "MPIW",
     "NamedFactor",
     "contract_log_marginal",
     "contract_with_source_terms",
