@@ -184,18 +184,28 @@ class MPIW:
             factors.append(model_factor - guide_factor - prep.log_num_samples)
         return factors, prep.eliminate, prep.plates
 
-    def log_marginal(self, rng_key, *args, **kwargs) -> jax.Array:
-        """Estimate ``log P_MP(x)``, an (unbiased-for-``P(x)``) marginal likelihood."""
+    def log_marginal(self, rng_key, *args, serial_sites=(), **kwargs) -> jax.Array:
+        """Estimate ``log P_MP(x)``, an (unbiased-for-``P(x)``) marginal likelihood.
+
+        :param serial_sites: names of latent sites whose ``K`` dimensions should be
+            summed serially (memory-frugal :func:`lax.scan` path); see
+            :func:`~numpyro.contrib.mpiw.contraction.contract_log_marginal`.
+        """
         prep = self._prepare(rng_key, *args, **kwargs)
         factors, eliminate, plates = self._build_factors(prep)
-        return contract_log_marginal(factors, eliminate, plates)
+        return contract_log_marginal(
+            factors, eliminate, plates, frozenset(serial_sites)
+        )
 
-    def site_weights(self, rng_key, *args, **kwargs):
+    def site_weights(self, rng_key, *args, serial_sites=(), **kwargs):
         """Return ``{site: (values, weights)}`` for each latent site.
 
         ``values`` are the guide's ``K`` samples (shape ``(K, *plates)``); ``weights``
         are the matching self-normalized posterior importance weights (same shape),
         summing to one over the ``K`` axis within each plate element.
+
+        :param serial_sites: names of latent sites to contract serially (memory-frugal);
+            the gradient is taken through the serial loop.
         """
         prep = self._prepare(rng_key, *args, **kwargs)
         source_shapes = {
@@ -204,7 +214,9 @@ class MPIW:
             if not s.is_observed
         }
         _, weights = contract_with_source_terms(
-            lambda st: self._build_factors(prep, st), source_shapes
+            lambda st: self._build_factors(prep, st),
+            source_shapes,
+            frozenset(serial_sites),
         )
         result = {}
         for name in source_shapes:
@@ -216,14 +228,15 @@ class MPIW:
             result[name] = (value, weight)
         return result
 
-    def moments(self, rng_key, statistics, *args, **kwargs):
+    def moments(self, rng_key, statistics, *args, serial_sites=(), **kwargs):
         """Posterior moments of per-site ``statistics``.
 
         :param statistics: ``{site: fn}`` where ``fn(values)`` maps the site's ``K``
             samples to a statistic; the weighted sum over the ``K`` axis is returned.
+        :param serial_sites: names of latent sites to contract serially (memory-frugal).
         :returns: ``{site: weighted_statistic}`` for each requested site.
         """
-        weights = self.site_weights(rng_key, *args, **kwargs)
+        weights = self.site_weights(rng_key, *args, serial_sites=serial_sites, **kwargs)
         out = {}
         for name, fn in statistics.items():
             values, w = weights[name]

@@ -31,11 +31,29 @@ from collections import OrderedDict
 from typing import Callable, NamedTuple
 
 import jax
+import jax.numpy as jnp
+import jax.scipy.special
 
 import funsor
 import funsor.optimizer
 
 funsor.set_backend("jax")
+
+
+def _slice_tensor(tensor, dim, index):
+    """Slice a funsor ``Tensor`` at ``dim == index``, dropping ``dim`` from its inputs.
+
+    ``index`` may be a traced scalar (e.g. a ``lax.scan`` carry), so a dynamic slice is
+    used. Tensors that do not mention ``dim`` are returned unchanged.
+    """
+    if dim not in tensor.inputs:
+        return tensor
+    axis = list(tensor.inputs).index(dim)
+    data = jax.lax.dynamic_index_in_dim(tensor.data, index, axis=axis, keepdims=False)
+    new_inputs = OrderedDict(
+        (name, domain) for name, domain in tensor.inputs.items() if name != dim
+    )
+    return funsor.Tensor(data, new_inputs, tensor.dtype)
 
 
 class NamedFactor(NamedTuple):
@@ -62,6 +80,7 @@ def contract_log_marginal(
     factors: list[NamedFactor],
     eliminate: frozenset[str],
     plates: frozenset[str],
+    serial_dims: frozenset[str] = frozenset(),
 ) -> jax.Array:
     """Contract MPIW log-factors into a scalar ``log P_MP(x)``.
 
@@ -75,34 +94,71 @@ def contract_log_marginal(
         should include the importance-weight log-ratio
         ``log p(z_i | parents) - log q(z_i | parents) - log K`` (the ``- log K``
         implementing the uniform ``1 / K**n`` average over sample combinations), and
-        for each observed site the model log density ``log p(x | parents)``.
-    :param factors: each item is either a :class:`NamedFactor` or, for factors produced
-        directly from a traced model, a :class:`funsor.Funsor` already carrying named
-        inputs.
+        for each observed site the model log density ``log p(x | parents)``. Each item
+        is either a :class:`NamedFactor` or, for factors produced directly from a traced
+        model, a :class:`funsor.Funsor` already carrying named inputs.
     :param eliminate: names of the sample-index ("K") dimensions to sum out.
     :param plates: names of plate dimensions (a subset of the dimensions appearing in
         ``factors``); these are reduced as products, not sums.
+    :param serial_dims: names of eliminated ("K") dimensions to sum over *serially*,
+        via a :func:`jax.lax.scan` loop that slices those dimensions out one index at a
+        time and densely contracts the remainder. This trades compute for memory: the
+        combined intermediate over the remaining dimensions is never materialized with
+        the serial dimensions present. Must be a subset of ``eliminate`` and must name
+        only non-plated (global) dimensions -- a dimension eliminated independently per
+        plate element cannot be summed with a single shared serial index. An empty set
+        (default) uses the fully dense contraction. The result is identical to the dense
+        path (up to floating point) and remains differentiable, so the source-term trick
+        still works.
     :returns: the scalar ``log P_MP(x)``.
     """
-    funsor_factors = [
-        f.to_funsor() if isinstance(f, NamedFactor) else f for f in factors
-    ]
-    with funsor.interpretations.lazy:
-        lazy = funsor.sum_product.sum_product(
-            funsor.ops.logaddexp,
-            funsor.ops.add,
-            funsor_factors,
-            eliminate=eliminate | plates,
-            plates=plates,
-        )
-    result = funsor.optimizer.apply_optimizer(lazy)
-    if result.inputs:
+    tensors = [f.to_funsor() if isinstance(f, NamedFactor) else f for f in factors]
+
+    if not serial_dims:
+        with funsor.interpretations.lazy:
+            lazy = funsor.sum_product.sum_product(
+                funsor.ops.logaddexp,
+                funsor.ops.add,
+                tensors,
+                eliminate=eliminate | plates,
+                plates=plates,
+            )
+        result = funsor.optimizer.apply_optimizer(lazy)
+        if result.inputs:
+            raise ValueError(
+                "Expected log P_MP to contract to a scalar, but the result still has "
+                f"free dimensions {tuple(result.inputs)}. Check that `eliminate` names "
+                "every sample-index dimension and that plate dimensions are declared."
+            )
+        return result.data
+
+    if not serial_dims <= eliminate:
         raise ValueError(
-            "Expected log P_MP to contract to a scalar, but the result still has "
-            f"free dimensions {tuple(result.inputs)}. Check that `eliminate` names "
-            "every sample-index dimension and that plate dimensions are declared."
+            f"serial_dims must be a subset of eliminate; got {tuple(serial_dims)} "
+            f"not in {tuple(eliminate)}."
         )
-    return result.data
+    # A serial dimension must be eliminated by a single global logsumexp, not one that
+    # is nested inside a plate (whose elimination is independent per plate element). A
+    # dimension is "global" iff some factor mentions it without any plate dimension;
+    # slicing a plated dimension with one shared index would silently give wrong results.
+    for dim in serial_dims:
+        if not any(dim in t.inputs and plates.isdisjoint(t.inputs) for t in tensors):
+            raise ValueError(
+                f"serial dimension {dim!r} occurs only inside plates; serial "
+                "contraction is only supported for non-plated (global) dimensions."
+            )
+    # Peel off one serial dimension and sum over it with a scan; recurse on the rest.
+    dim = sorted(serial_dims)[0]
+    rest = serial_dims - {dim}
+    size = next(t.inputs[dim].size for t in tensors if dim in t.inputs)
+
+    def body(carry, index):
+        sliced = [_slice_tensor(t, dim, index) for t in tensors]
+        partial = contract_log_marginal(sliced, eliminate - {dim}, plates, rest)
+        return carry, partial
+
+    _, partials = jax.lax.scan(body, 0.0, jnp.arange(size))
+    return jax.scipy.special.logsumexp(partials, axis=0)
 
 
 def contract_with_source_terms(
@@ -111,6 +167,7 @@ def contract_with_source_terms(
         tuple[list[NamedFactor], frozenset[str], frozenset[str]],
     ],
     source_shapes: dict[str, tuple[int, ...]],
+    serial_dims: frozenset[str] = frozenset(),
 ) -> tuple[jax.Array, dict[str, jax.Array]]:
     """Estimate ``log P_MP(x)`` and per-site importance weights via the source-term trick.
 
@@ -130,15 +187,17 @@ def contract_with_source_terms(
     :param source_shapes: for each latent site name, the shape of its source-term array
         (the shape of that site's own dimensions, in the same axis order used in its
         factor).
+    :param serial_dims: eliminated dimensions to contract serially (see
+        :func:`contract_log_marginal`); the gradient (weights) is taken through the
+        serial ``lax.scan``, so this bounds memory for the moment computation too.
     :returns: ``(log_marginal, weights)`` where ``weights[name]`` has shape
         ``source_shapes[name]`` and, summed over the site's K axis, is one per plate
         element.
     """
-    import jax.numpy as jnp
 
     def logp(source_terms: dict[str, jax.Array]) -> jax.Array:
         factors, eliminate, plates = build_factors(source_terms)
-        return contract_log_marginal(factors, eliminate, plates)
+        return contract_log_marginal(factors, eliminate, plates, serial_dims)
 
     zeros = {name: jnp.zeros(shape) for name, shape in source_shapes.items()}
     log_marginal, weights = jax.value_and_grad(logp)(zeros)
