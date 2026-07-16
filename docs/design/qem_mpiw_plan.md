@@ -72,9 +72,9 @@ plus the M-step machinery, written against plain pytrees.
 `from_mean_params` registries via `singledispatch`, plus `canonical_params` (names the
 constructor args to rebuild each family — needed where `arg_constraints`
 over-specifies, e.g. MVN) and `base_distribution` / `is_exp_family` helpers.
-Closed-form families: Normal, MultivariateNormal, Bernoulli (probs & logits),
-Categorical (probs & logits), Poisson, Exponential; Independent/ExpandedDistribution
-unwrapped transparently. Tests in `test/test_exp_family.py` (MC consistency,
+Closed-form families: Normal, MultivariateNormal, LogNormal, Bernoulli (probs &
+logits), Categorical (probs & logits), Poisson, Exponential;
+Independent/ExpandedDistribution unwrapped transparently. Tests in `test/test_exp_family.py` (MC consistency,
 round-trips, conjugate Normal-Normal and MVN recovery via weighted moment matching).
 
 - **Mean-parameter format**: plain pytrees (dicts of arrays) per site — never efax
@@ -154,6 +154,14 @@ anywhere in this branch.
 - ⏳ Remaining niceties: vectorize `sample_posterior` over draws (currently a sequential
   loop); event-dim-aware behavior for statistics beyond the mean; the fully hand-rolled
   einsum fallback (only if funsor becomes a problem).
+- ⚠️ **Serial-path limitation (discovered by the branch-4 benchmark, 2026-07-16):**
+  `serial_sites` bounds *contraction intermediates* only. Each site's **input factor**
+  is still materialized densely in `MPIW._prepare` (the site's `log_prob` broadcasts
+  over all its K-sampled parents *before* any contraction), so a site with 2 parents
+  costs K³ × plates memory regardless of serialization — 8.6 GB at K=512 on the
+  eight-schools model (`theta` couples `mu`, `tau`). True memory-frugality needs
+  slice-aware *factor construction* (compute `log_prob` per serial slice inside the
+  scan), a future branch-3 item.
 
 **Components:**
 
@@ -345,8 +353,24 @@ green + ruff clean):
   is too strong; the removed covariance term is smaller than the variance the
   independent normalizer introduces, at least for from-prior proposals at small
   K. Default stays off; benchmark should re-test in the adapted-proposal regime.
-- ⏳ Remaining: PSIS k-hat diagnostics, the QEM-vs-VI benchmark below, λ(t)
-  reference against the paper's exact constants once re-checked.
+- ✅ **PSIS k-hat diagnostics** — public `psis_khat(log_weights)` added to
+  `numpyro.infer.importance` (this fork already had `psis_diagnostic`; no Pyro
+  port needed); `QEM.psis_diagnostic` (global model/guide k-hat at the state's
+  params) and `QEM.site_khats` (per-site k-hat of one E-step's MPIW marginal
+  weights, pooled across plate elements). Caveat: the per-site fit sees only K
+  weights per plate element, and k-hat measures *tail heaviness*, not proposal
+  distance (bounded-likelihood weights at a bad proposal can still give k < 0).
+- 📌 **Benchmark finding — ill-posed ELBO under Exponential scale guides**
+  (2026-07-16): with `tau ~ Exponential` and the family-mirroring guide, the
+  mean-field ELBO term `−E_q[1/τ²]·E_q[(θ−μ)²]/2` has `E_q[1/τ²] = ∞`, so SVI
+  cannot fit this guide family at any learning rate (tail ELBO −10³..−10⁵,
+  fitted-guide MPIW evidence ~5 nats worse than QEM's), while QEM — which never
+  evaluates `E_q[log p]` — fits it without issue. The benchmark's schools model
+  therefore uses a LogNormal scale prior (all inverse moments finite) so both
+  arms are well-posed; the Exponential variant is documented in the example as a
+  qualitative robustness result.
+- ⏳ Remaining: λ(t) reference against the paper's exact constants once
+  re-checked.
 
 - `QEM` class mirroring the `SVI` API surface (`init`/`update`/`run`), state = per-site
   mean-param pytrees + RNG key. No optax, no param store:
