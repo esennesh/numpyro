@@ -14,7 +14,7 @@ from numpyro.infer.elbo import (
 from numpyro.infer.ensemble import AIES, ESS
 from numpyro.infer.hmc import HMC, NUTS
 from numpyro.infer.hmc_gibbs import HMCECS, DiscreteHMCGibbs, HMCGibbs
-from numpyro.infer.importance import psis_diagnostic
+from numpyro.infer.importance import psis_diagnostic, psis_khat
 from numpyro.infer.initialization import (
     init_to_feasible,
     init_to_mean,
@@ -48,6 +48,7 @@ __all__ = [
     "initialize_model",
     "log_likelihood",
     "psis_diagnostic",
+    "psis_khat",
     "reparam",
     "BarkerMH",
     "DiscreteHMCGibbs",

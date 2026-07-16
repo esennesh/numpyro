@@ -20,6 +20,7 @@ See ``docs/design/qem_mpiw_plan.md``.
 """
 
 from collections import namedtuple
+import warnings
 
 import tqdm
 
@@ -33,6 +34,10 @@ from numpyro.distributions.exp_family import (
     is_exp_family,
     mean_params,
     sufficient_statistics,
+)
+from numpyro.infer.importance import (
+    psis_diagnostic as importance_psis_diagnostic,
+    psis_khat,
 )
 
 QEMState = namedtuple("QEMState", ["mean_params", "step", "rng_key"])
@@ -211,6 +216,55 @@ class QEM:
         return self._mpiw(state).log_marginal(
             eval_key, *args, serial_sites=self.serial_sites, **kwargs
         )
+
+    def psis_diagnostic(self, state, *args, num_particles=1000, **kwargs):
+        """Global PSIS k-hat of the fitted guide as an importance proposal.
+
+        Runs :func:`numpyro.infer.importance.psis_diagnostic` on the model and
+        the guide at ``state``'s parameters, using fresh single-sample joint
+        importance weights ``log p(x, z) - log q(z)``. Values below 0.5 indicate
+        a reliable proposal; above 0.7, unreliable (Vehtari et al. 2024).
+
+        Uses (and does not advance) ``state.rng_key``.
+        """
+        _, diag_key = random.split(state.rng_key)
+        return importance_psis_diagnostic(
+            diag_key,
+            self.get_params(state),
+            self.model,
+            self.guide,
+            *args,
+            num_particles=num_particles,
+            **kwargs,
+        )
+
+    def site_khats(self, state, *args, **kwargs):
+        """Per-site PSIS k-hat of one E-step's marginal importance weights.
+
+        Runs a single MPIW pass at ``state``'s parameters and fits the
+        Generalized Pareto tail of each latent site's ``K`` self-normalized
+        marginal weights, flattened across plate elements (each plate element's
+        weights sum to one, so they share a scale). A site's k-hat says how
+        reliably its moments are being estimated at the current proposal; note
+        the fit sees only ``num_samples`` weights per plate element, so prefer
+        moderate-to-large ``K`` when reading it. Discrete sites with few support
+        points often produce degenerate tails (``nan``/``inf`` k-hat) --
+        interpret those via the weights directly.
+
+        Uses (and does not advance) ``state.rng_key``.
+
+        :return: ``{site: k-hat}`` for each latent site.
+        """
+        _, diag_key = random.split(state.rng_key)
+        site_weights = self._mpiw(state).site_weights(
+            diag_key, *args, serial_sites=self.serial_sites, **kwargs
+        )
+        khats = {}
+        for name, (_, weights) in site_weights.items():
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                khats[name] = psis_khat(jnp.log(weights))
+        return khats
 
     def run(self, rng_key, num_steps, *args, progress_bar=True, **kwargs):
         """Run ``num_steps`` QEM iterations from a fresh init.

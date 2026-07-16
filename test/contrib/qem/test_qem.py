@@ -205,6 +205,27 @@ def test_forget_semantics():
         QEM(scalar_model, guide, num_samples=32, forget=1.5)
 
 
+def test_psis_diagnostics():
+    """A fitted conjugate guide is a near-perfect proposal: k-hat well under 0.7."""
+    guide = AutoExponentialFamily(scalar_model)
+    qem = QEM(scalar_model, guide, num_samples=128)
+    state = qem.init(random.PRNGKey(0))
+    for _ in range(30):
+        state, _ = qem.update(state)
+
+    khat = qem.psis_diagnostic(state, num_particles=2000)
+    assert khat < 0.7
+
+    site_khats = qem.site_khats(state)
+    assert set(site_khats) == {"z"}
+    assert site_khats["z"] < 0.7
+
+    # k-hat is also computable at the (unfitted) prior-matched init; here the
+    # weights are proportional to a bounded likelihood, so the tail is thin
+    init_khats = qem.site_khats(qem.init(random.PRNGKey(0)))
+    assert init_khats["z"] < 0.7
+
+
 def test_non_exp_family_site_rejected():
     def model():
         z = numpyro.sample("z", dist.StudentT(3.0))

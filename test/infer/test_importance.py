@@ -16,6 +16,7 @@ from numpyro.infer.importance import (
     _fit_generalized_pareto,
     _psis_khat,
     psis_diagnostic,
+    psis_khat,
 )
 
 # --- Model/guide helpers ---
@@ -345,3 +346,20 @@ def test_fit_generalized_pareto_all_identical():
     k, sigma = _fit_generalized_pareto(np.ones(100))
     assert np.isfinite(k)
     assert np.isnan(sigma)
+
+
+# --- Public psis_khat tests ---
+
+
+def test_psis_khat_public_matches_private():
+    lw = _synthetic_log_weights(0.8)
+    assert psis_khat(lw) == pytest.approx(_psis_khat(lw.copy()))
+    # accepts multi-dimensional and jax inputs (flattened before fitting)
+    assert psis_khat(jnp.asarray(lw).reshape(100, -1)) == pytest.approx(
+        _psis_khat(lw.copy())
+    )
+
+
+def test_psis_khat_rejects_too_few_weights():
+    with pytest.raises(ValueError, match="at least 2"):
+        psis_khat(np.zeros(1))

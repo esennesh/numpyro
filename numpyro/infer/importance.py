@@ -28,7 +28,7 @@ from jax import device_get, random
 from numpyro.handlers import seed
 from numpyro.infer.elbo import get_importance_log_probs
 
-__all__ = ["psis_diagnostic"]
+__all__ = ["psis_diagnostic", "psis_khat"]
 
 
 def _fit_generalized_pareto(x: np.ndarray) -> tuple[float, float]:
@@ -181,6 +181,26 @@ def _psis_khat(log_weights: np.ndarray) -> float:
     k, sigma = _fit_generalized_pareto(tail)
 
     return float(k)
+
+
+def psis_khat(log_weights) -> float:
+    """Compute the PSIS k-hat statistic from raw log importance weights.
+
+    Unlike :func:`psis_diagnostic`, which draws fresh single-sample importance
+    weights for a model/guide pair, this fits the Generalized Pareto tail of
+    weights the caller already holds (e.g. the per-site marginal weights of a
+    massively parallel importance sampler). See :func:`psis_diagnostic` for the
+    interpretation of the returned value.
+
+    :param log_weights: array of raw (unnormalized is fine) log importance
+        weights; flattened before fitting.
+    :return: the estimated k-hat statistic.
+    :rtype: float
+    """
+    log_weights = np.asarray(device_get(log_weights), dtype=float).reshape(-1)
+    if len(log_weights) < 2:
+        raise ValueError("psis_khat requires at least 2 log weights.")
+    return _psis_khat(log_weights)
 
 
 def psis_diagnostic(
