@@ -20,7 +20,7 @@ rebuild each family (needed where ``arg_constraints`` over-specifies, e.g.
 :class:`~numpyro.distributions.MultivariateNormal`).
 
 Closed-form implementations are provided for Normal, MultivariateNormal,
-Bernoulli, Categorical, Poisson and Exponential; :class:`Independent` and
+LogNormal, Bernoulli, Categorical, Poisson and Exponential; :class:`Independent` and
 :class:`ExpandedDistribution` wrappers are unwrapped transparently. Additional
 families (including iterative NP↔EP conversions) can be registered externally —
 see ``docs/design/qem_mpiw_plan.md``.
@@ -34,6 +34,7 @@ from jax.scipy.special import logit
 
 from numpyro.distributions.continuous import (
     Exponential,
+    LogNormal,
     MultivariateNormal,
     Normal,
 )
@@ -59,8 +60,8 @@ __all__ = [
 def _not_registered(d):
     return NotImplementedError(
         f"{type(d).__name__} has no exponential-family registration. Supported "
-        "out of the box: Normal, MultivariateNormal, Bernoulli, Categorical, "
-        "Poisson, Exponential (optionally wrapped in Independent or "
+        "out of the box: Normal, MultivariateNormal, LogNormal, Bernoulli, "
+        "Categorical, Poisson, Exponential (optionally wrapped in Independent or "
         "ExpandedDistribution). Register implementations of sufficient_statistics, "
         "mean_params and from_mean_params to add a family."
     )
@@ -198,6 +199,30 @@ def _(d, params):
     var = m2 - jnp.square(m1)
     tiny = jnp.finfo(jnp.result_type(var)).tiny
     return Normal(m1, jnp.sqrt(jnp.maximum(var, tiny)))
+
+
+@sufficient_statistics.register(LogNormal)
+def _(d, value):
+    logx = jnp.log(_float(value))
+    return {"logx": logx, "logxlogx": jnp.square(logx)}
+
+
+@mean_params.register(LogNormal)
+def _(d):
+    return {
+        "logx": jnp.broadcast_to(d.loc, d.batch_shape),
+        "logxlogx": jnp.broadcast_to(
+            jnp.square(d.loc) + jnp.square(d.scale), d.batch_shape
+        ),
+    }
+
+
+@from_mean_params.register(LogNormal)
+def _(d, params):
+    m1, m2 = params["logx"], params["logxlogx"]
+    var = m2 - jnp.square(m1)
+    tiny = jnp.finfo(jnp.result_type(var)).tiny
+    return LogNormal(m1, jnp.sqrt(jnp.maximum(var, tiny)))
 
 
 def _outer(x):
