@@ -67,6 +67,16 @@ branch 4's `AutoExponentialFamily` then derives from the ported class.
 Everything QEM needs from "exponential family" expressed as an efax-agnostic protocol,
 plus the M-step machinery, written against plain pytrees.
 
+**Progress: complete** (branch `feature/exp-family-interface`, all green + ruff clean):
+`numpyro/distributions/exp_family.py` — `sufficient_statistics` / `mean_params` /
+`from_mean_params` registries via `singledispatch`, plus `canonical_params` (names the
+constructor args to rebuild each family — needed where `arg_constraints`
+over-specifies, e.g. MVN) and `base_distribution` / `is_exp_family` helpers.
+Closed-form families: Normal, MultivariateNormal, Bernoulli (probs & logits),
+Categorical (probs & logits), Poisson, Exponential; Independent/ExpandedDistribution
+unwrapped transparently. Tests in `test/test_exp_family.py` (MC consistency,
+round-trips, conjugate Normal-Normal and MVN recovery via weighted moment matching).
+
 - **Mean-parameter format**: plain pytrees (dicts of arrays) per site — never efax
   objects. This is the only mutable state QEM will carry (the paper requires the EMA to
   be over *mean* params, Appendix B; making them the only state enforces that).
@@ -301,6 +311,32 @@ oracle the branch-4 benchmark reuses. Keep it small enough to run in CI (a handf
 sites/species); the scaling story belongs to branch 4.
 
 ### Branch 4 — `feature/qem`: the QEM driver (depends on 1 + 3)
+
+**Progress: core complete** (branch `feature/qem` = merge of branches 1 + 3, all
+green + ruff clean):
+
+- ✅ **`QEM` driver** — `numpyro/contrib/qem/core.py`: `init`/`update`/`run`/
+  `get_params`/`evaluate` mirroring SVI; state = per-site mean-param pytrees +
+  step + rng key; M-step via `params_from_mean` + `handlers.substitute`
+  (SVI-compatible param flow); E-step via a new
+  `MPIW.log_marginal_and_site_weights` (weights + log P_MP from one contraction);
+  EMA on mean params with fixed λ, callable λ(t), or the default Thm-1 schedule
+  λ(t) = 1 − t^(−p).
+- ✅ **`AutoExponentialFamily`** — `numpyro/infer/autoguide.py`, written directly
+  against `AutoGuide` (the `AutoMeanFieldProposal` port became unnecessary; its
+  vestigial bugs are simply absent). Mirrors each prior's base family with
+  unconstrained `{site}_{prefix}_{arg}` params (canonical args, prior-valued
+  init), supports discrete latent sites (overrides `_setup_prototype` to skip the
+  base class's discrete-support rejection), working `sample_posterior`, rejects
+  subsampled plates. Usable with plain SVI too (tested).
+- ✅ **Tests** — `test/contrib/qem/test_qem.py`: conjugate recovery (scalar
+  Normal, plated hierarchical, MVN site, discrete Bernoulli), log P_MP trace →
+  analytic evidence, prior-matched init, forget/schedule semantics + validation,
+  non-EF rejection, reparameterization invariance (Thm 2, α = 1e-2 trajectories
+  match to rtol 1e-8), SVI compatibility.
+- ⏳ Remaining: decorrelated-normalizer variant (§4 flag), PSIS k-hat diagnostics,
+  the QEM-vs-VI benchmark below, λ(t) reference against the paper's exact
+  constants once re-checked.
 
 - `QEM` class mirroring the `SVI` API surface (`init`/`update`/`run`), state = per-site
   mean-param pytrees + RNG key. No optax, no param store:
