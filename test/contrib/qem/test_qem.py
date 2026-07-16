@@ -199,8 +199,12 @@ def test_forget_semantics():
         rstate.mean_params["z"]["x"], state1.mean_params["z"]["x"]
     )
 
+    # Theorem 1 covers 0 < p < 1; p inside that range is accepted
+    QEM(scalar_model, guide, num_samples=32, schedule_power=0.3)
     with pytest.raises(ValueError, match="schedule_power"):
-        QEM(scalar_model, guide, num_samples=32, schedule_power=0.3)
+        QEM(scalar_model, guide, num_samples=32, schedule_power=0.0)
+    with pytest.raises(ValueError, match="schedule_power"):
+        QEM(scalar_model, guide, num_samples=32, schedule_power=1.5)
     with pytest.raises(ValueError, match="forget"):
         QEM(scalar_model, guide, num_samples=32, forget=1.5)
 

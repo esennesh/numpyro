@@ -369,8 +369,8 @@ green + ruff clean):
   therefore uses a LogNormal scale prior (all inverse moments finite) so both
   arms are well-posed; the Exponential variant is documented in the example as a
   qualitative robustness result.
-- ⏳ Remaining: λ(t) reference against the paper's exact constants once
-  re-checked.
+- ✅ λ(t) schedule verified against the paper (see the paper-fidelity checklist
+  below for the full findings) — branch 4 complete.
 
 - `QEM` class mirroring the `SVI` API surface (`init`/`update`/`run`), state = per-site
   mean-param pytrees + RNG key. No optax, no param store:
@@ -458,13 +458,39 @@ Discrete-capable MCMC methods available in this fork if ever needed for the orac
 
 ## Paper-fidelity checklist
 
-- EMA over **mean** parameters only (App. B) — enforced by state format.
-- λ(t) = 1 − t^(−p) schedule available (Thm 1).
+- ✅ EMA over **mean** parameters only (App. B) — enforced by state format.
+  (Verified against the paper, p. 8: mean-param EMA is chosen because only it
+  shares fixed points with MP-RWS; natural/conventional-param EMAs differ.)
+- ✅ λ(t) = 1 − t^(−p) schedule available (Thm 1) — **verified against the paper
+  2026-07-16** (arXiv:2503.08264, Thm 1 + App. D). Findings:
+  - The paper's conventions are internally inconsistent: Eq. 8 / Algorithm 1
+    write `m_t = (1−λ) m_{t−1} + λ m^{one iter}` (λ = weight on the *fresh*
+    estimate, grid-searched over {0.3, 0.1, 0.03, 0.01, 0.003, 0.001} like a
+    learning rate in the experiments — no schedule used there), while Thm 1 /
+    App. D's proof (Eq. 35, `m_t = (1−λ) Σ λ^{t−τ} m_τ`) unrolls
+    `m_t = λ m_{t−1} + (1−λ) m̂` — λ = *retention*. The schedule
+    λ(t) = 1 − t^(−p) only yields the theorem's unbiased/zero-variance limit in
+    the retention reading (fresh-estimate weight t^(−p), Robbins–Monro style).
+  - Our `QEM(forget=...)` follows the theorem's (retention) convention —
+    documented in the docstring with the mapping `forget = 1 − λ_paper(Eq. 8)`.
+  - Thm 1 states 0 < p < 1 (the frozen-λ geometric-series proof needs p < 1:
+    Eq. 43's divergence fails at p = 1). Code now validates p ∈ (0, 1]; the
+    default p = 1 (running average) sits outside the theorem but is unbiased
+    with O(1/t) variance by direct argument.
+  - The claim after Thm 1 that a second sample z′ ~ Q_MP makes the finite-K
+    one-iter estimator *unbiased* is the decorrelated normalizer implemented in
+    branch 4; it is not exactly unbiased (E[N/D′] = E[N]·E[1/P_MP(z′)] and
+    E[1/P_MP(z′)] > 1/P(x) by Jensen) — see the branch-4 empirical note, where
+    the surviving positive bias is visible at small K.
 - Permutation parent-selection default (App. A; pyro-torch precedent has
-  diagonal/mixture — we add permutation).
-- Unbiased P_MP option via a second sample (§4).
-- Reparameterization invariance (Thm 2) as an integration test: scale a latent by
-  α ∈ {1e-2, 1e-4}, check QEM trajectories match to float tolerance.
+  diagonal/mixture — we add permutation). Still open: the messenger is
+  mean-field-only so far, so no scheme is exercised yet.
+- Unbiased P_MP option via a second sample (§4) — implemented as
+  `decorrelated_normalizer`; "unbiased" is the paper's term, see above.
+- ✅ Reparameterization invariance (Thm 2) as an integration test: scale a latent by
+  α ∈ {1e-2, 1e-4}, check QEM trajectories match to float tolerance — covered by
+  `test_reparameterization_invariance` (α = 1e-2, rtol 1e-8) and the benchmark's
+  α-scaling panel (α ∈ {1, 1e-2, 1e-4}).
 
 ## Decisions log
 

@@ -77,14 +77,28 @@ class QEM:
     :param guide: an :class:`~numpyro.infer.autoguide.AutoExponentialFamily` (or
         compatible) mean-field guide over the model's latent sites.
     :param int num_samples: number of proposals ``K`` drawn per latent site.
-    :param forget: EMA forgetting factor ``lambda`` in
+    :param forget: EMA *retention* factor ``lambda`` in
         ``m_t = lambda * m_{t-1} + (1 - lambda) * m_hat_t``: a float for a fixed
-        factor, or a callable ``t -> lambda_t``. Defaults to the paper's Theorem 1
-        schedule ``lambda(t) = 1 - t**(-schedule_power)`` (so the first update
-        takes the raw estimate in full).
-    :param float schedule_power: the power ``p`` of the default schedule; the
-        paper's convergence guarantee needs ``0.5 < p <= 1``. Ignored when
-        ``forget`` is given.
+        factor, or a callable ``t -> lambda_t``. Defaults to the schedule
+        ``lambda(t) = 1 - t**(-schedule_power)`` of the paper's Theorem 1 (so
+        the first update takes the raw estimate in full, and the weight on the
+        fresh estimate decays as ``t**(-p)``).
+
+        .. note:: Conventions in the paper differ between its main text and its
+            theory: Eq. 8 / Algorithm 1 write the EMA with ``lambda`` as the
+            weight on the *fresh* estimate (their experiments grid-search that
+            ``lambda`` over {0.3, 0.1, ..., 0.001} like a learning rate), while
+            Theorem 1 / Appendix D use ``lambda`` as the *retained* fraction --
+            Eq. 35 unrolls ``m_t = lambda * m_{t-1} + (1 - lambda) * m_hat``,
+            and the schedule ``lambda(t) = 1 - t**(-p)`` only yields the
+            theorem's unbiased/zero-variance limit in that reading. ``forget``
+            follows the theorem's (retention) convention; to reproduce a
+            main-text/experimental ``lambda``, pass ``forget = 1 - lambda``.
+    :param float schedule_power: the power ``p`` of the default schedule.
+        Theorem 1 covers ``0 < p < 1``; ``p = 1`` (a running average of all
+        one-iteration estimates -- the default) is also sound (unbiased with
+        ``O(1/t)`` variance by direct argument) though outside the theorem's
+        stated range. Ignored when ``forget`` is given.
     :param bool decorrelated_normalizer: normalize the E-step weights by
         ``P_MP`` of a second, *independent* batch of guide samples (paper section
         4) instead of the same-batch ``P_MP``. This removes the
@@ -115,9 +129,9 @@ class QEM:
         self.guide = guide
         self.num_samples = num_samples
         if forget is None:
-            if not 0.5 < schedule_power <= 1.0:
+            if not 0.0 < schedule_power <= 1.0:
                 raise ValueError(
-                    f"schedule_power must be in (0.5, 1], got {schedule_power}"
+                    f"schedule_power must be in (0, 1], got {schedule_power}"
                 )
             self._forget = lambda t: 1.0 - float(t) ** -schedule_power
         elif callable(forget):
