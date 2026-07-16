@@ -19,6 +19,11 @@ import numpyro
 from numpyro import handlers
 import numpyro.distributions as dist
 from numpyro.distributions import constraints
+from numpyro.distributions.exp_family import (
+    base_distribution,
+    canonical_params,
+    from_mean_params,
+)
 from numpyro.distributions.flows import (
     BlockNeuralAutoregressiveTransform,
     InverseAutoregressiveTransform,
@@ -40,7 +45,11 @@ from numpyro.distributions.util import (
 )
 from numpyro.infer import Predictive
 from numpyro.infer.elbo import Trace_ELBO
-from numpyro.infer.initialization import init_to_median, init_to_uniform
+from numpyro.infer.initialization import (
+    init_to_median,
+    init_to_sample,
+    init_to_uniform,
+)
 from numpyro.infer.util import (
     helpful_support_errors,
     initialize_model,
@@ -65,6 +74,7 @@ __all__ = [
     "AutoBNAFNormal",
     "AutoIAFNormal",
     "AutoDelta",
+    "AutoExponentialFamily",
     "AutoSemiDAIS",
     "AutoSurrogateLikelihoodDAIS",
 ]
@@ -524,6 +534,198 @@ class AutoNormal(AutoGuide):
             for k in locs
         }
         return self._constrain(latent)
+
+
+class AutoExponentialFamily(AutoGuide):
+    """
+    Mean-field guide that mirrors each latent site's prior *family*: per site, the
+    prior is unwrapped to its base distribution and a distribution of the same class
+    with learnable parameters (initialized at the prior's own values) is used as the
+    proposal, re-applying ``.to_event`` as needed. Guide samples therefore live
+    directly in the prior's support -- no change of variables is introduced.
+
+    Parameters are stored unconstrained under the names ``{site}_{prefix}_{arg}``
+    (one per canonical constructor argument, see
+    :func:`~numpyro.distributions.exp_family.canonical_params`) and transformed with
+    :func:`~numpyro.distributions.biject_to`, so the guide is usable with
+    :class:`~numpyro.infer.svi.SVI` as well as gradient-free fitting.
+
+    This is the default guide for QEM (:mod:`numpyro.contrib.qem`): when every
+    prior is exponential-family (:mod:`numpyro.distributions.exp_family`), guide
+    sites are registry-recognizable, and :meth:`params_from_mean` maps per-site
+    mean-parameter pytrees to guide parameter values -- the QEM M-step.
+
+    .. note:: Data subsampling (plates with ``subsample_size``) is not supported.
+
+    Usage::
+
+        guide = AutoExponentialFamily(model)
+        qem = QEM(model, guide, num_samples=30)
+
+    :param callable model: A NumPyro model.
+    :param str prefix: a prefix that will be prefixed to all param internal sites.
+    :param callable init_loc_fn: A per-site initialization function; parent-site
+        values it produces determine the prior parameters at which the guide's own
+        parameters are initialized.
+    :param callable create_plates: An optional function inputting the same
+        ``*args,**kwargs`` as ``model()`` and returning a :class:`numpyro.plate`
+        or iterable of plates.
+    """
+
+    def __init__(
+        self,
+        model,
+        *,
+        prefix="auto",
+        init_loc_fn=init_to_sample,
+        create_plates=None,
+    ):
+        self._base_dists = {}
+        self._reinterpreted_ndims = {}
+        self._init_params = {}
+        super().__init__(
+            model, prefix=prefix, init_loc_fn=init_loc_fn, create_plates=create_plates
+        )
+
+    def _setup_prototype(self, *args, **kwargs):
+        # As AutoGuide._setup_prototype, minus the rejection of discrete latent
+        # sites: this guide mirrors the prior's family, so discrete latents pose
+        # no support problem (their *parameter* constraints are what get
+        # bijected, not their support).
+        rng_key = numpyro.prng_key()
+        with handlers.block(), warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=".*automatically enumerate.*",
+                category=FutureWarning,
+            )
+            (
+                init_params,
+                self._potential_fn_gen,
+                postprocess_fn_gen,
+                self.prototype_trace,
+            ) = initialize_model(
+                rng_key,
+                self.model,
+                init_strategy=self.init_loc_fn,
+                dynamic_args=True,
+                model_args=args,
+                model_kwargs=kwargs,
+            )
+        self._potential_fn = self._potential_fn_gen(*args, **kwargs)
+        postprocess_fn = postprocess_fn_gen(*args, **kwargs)
+        self._postprocess_fn = handlers.seed(postprocess_fn, rng_seed=0)
+        self._init_locs = init_params[0]
+
+        self._prototype_frames = {}
+        for name, site in self.prototype_trace.items():
+            if site["type"] == "sample" and not site["is_observed"]:
+                for frame in site["cond_indep_stack"]:
+                    if frame.name in self._prototype_frames:
+                        assert frame == self._prototype_frames[frame.name], (
+                            f"The plate {frame.name} has inconsistent dim or size. "
+                            "Please check your model again."
+                        )
+                    else:
+                        self._prototype_frames[frame.name] = frame
+            elif site["type"] == "plate":
+                self._prototype_frame_full_sizes[name] = site["args"][0]
+
+        for name, site in self.prototype_trace.items():
+            if site["type"] != "sample" or site["is_observed"]:
+                continue
+            for frame in site["cond_indep_stack"]:
+                if self._prototype_frame_full_sizes[frame.name] != frame.size:
+                    raise ValueError(
+                        "AutoExponentialFamily does not support data subsampling "
+                        f"(plate {frame.name})."
+                    )
+
+            base = base_distribution(site["fn"])
+            self._base_dists[name] = base
+            self._reinterpreted_ndims[name] = site["fn"].event_dim - base.event_dim
+            # batch + reinterpreted dims: everything left of the base's event shape
+            lead_shape = jnp.shape(site["value"])[
+                : jnp.ndim(site["value"]) - base.event_dim
+            ]
+
+            inits = {}
+            for arg, value in canonical_params(base).items():
+                transform = biject_to(base.arg_constraints[arg])
+                unconstrained = transform.inv(value)
+                u_event_ndim = transform.domain.event_dim
+                u_event_shape = jnp.shape(unconstrained)[
+                    jnp.ndim(unconstrained) - u_event_ndim :
+                ]
+                inits[arg] = jnp.broadcast_to(unconstrained, lead_shape + u_event_shape)
+            self._init_params[name] = inits
+
+    def __call__(self, *args, **kwargs):
+        if self.prototype_trace is None:
+            # run model to inspect the model structure
+            self._setup_prototype(*args, **kwargs)
+
+        plates = self._create_plates(*args, **kwargs)
+        result = {}
+        for name, site in self.prototype_trace.items():
+            if site["type"] != "sample" or site["is_observed"]:
+                continue
+
+            base = self._base_dists[name]
+            with ExitStack() as stack:
+                for frame in site["cond_indep_stack"]:
+                    stack.enter_context(plates[frame.name])
+
+                params = {}
+                for arg, init_value in self._init_params[name].items():
+                    transform = biject_to(base.arg_constraints[arg])
+                    unconstrained = numpyro.param(
+                        "{}_{}_{}".format(name, self.prefix, arg), init_value
+                    )
+                    params[arg] = transform(unconstrained)
+                site_fn = type(base)(**params).to_event(self._reinterpreted_ndims[name])
+
+                result[name] = numpyro.sample(name, site_fn)
+
+        return result
+
+    def params_from_mean(self, site_mean_params):
+        """Map per-site mean-parameter pytrees to guide parameter values.
+
+        Moment-matches each site's base family to its entry in
+        ``site_mean_params`` (see
+        :func:`~numpyro.distributions.exp_family.from_mean_params`) and returns
+        the corresponding unconstrained ``{site}_{prefix}_{arg}`` parameter dict,
+        suitable for :func:`~numpyro.handlers.substitute` or as ``init_params``
+        for :class:`~numpyro.infer.svi.SVI`.
+
+        :param dict site_mean_params: ``{site_name: mean-parameter pytree}``.
+        :return: dict of guide parameter values (unconstrained).
+        """
+        params = {}
+        for name, m in site_mean_params.items():
+            base = self._base_dists[name]
+            matched = base_distribution(from_mean_params(base, m))
+            for arg, value in canonical_params(matched).items():
+                transform = biject_to(base.arg_constraints[arg])
+                params["{}_{}_{}".format(name, self.prefix, arg)] = transform.inv(value)
+        return params
+
+    def _site_dist(self, name, params):
+        base = self._base_dists[name]
+        args = {}
+        for arg in canonical_params(base):
+            transform = biject_to(base.arg_constraints[arg])
+            args[arg] = transform(params["{}_{}_{}".format(name, self.prefix, arg)])
+        return type(base)(**args).to_event(self._reinterpreted_ndims[name])
+
+    def sample_posterior(self, rng_key, params, *args, sample_shape=(), **kwargs):
+        samples = {}
+        with handlers.seed(rng_seed=rng_key):
+            for name in self._base_dists:
+                site_fn = self._site_dist(name, params)
+                samples[name] = numpyro.sample(name, site_fn.expand_by(sample_shape))
+        return samples
 
 
 class AutoDelta(AutoGuide):
