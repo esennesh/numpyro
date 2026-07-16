@@ -19,8 +19,8 @@ import jax.numpy as jnp
 pytest.importorskip("funsor")
 
 import numpyro  # noqa: E402
-import numpyro.distributions as dist  # noqa: E402
 from numpyro.contrib.mpiw import MPIW  # noqa: E402
+import numpyro.distributions as dist  # noqa: E402
 
 jax.config.update("jax_enable_x64", True)
 
