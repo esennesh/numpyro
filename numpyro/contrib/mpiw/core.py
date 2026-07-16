@@ -197,12 +197,14 @@ class MPIW:
             factors, eliminate, plates, frozenset(serial_sites)
         )
 
-    def site_weights(self, rng_key, *args, serial_sites=(), **kwargs):
-        """Return ``{site: (values, weights)}`` for each latent site.
+    def log_marginal_and_site_weights(self, rng_key, *args, serial_sites=(), **kwargs):
+        """Return ``(log_marginal, {site: (values, weights)})`` in one contraction.
 
         ``values`` are the guide's ``K`` samples (shape ``(K, *plates)``); ``weights``
         are the matching self-normalized posterior importance weights (same shape),
         summing to one over the ``K`` axis within each plate element.
+        ``log_marginal`` is the same estimate as :meth:`log_marginal`, obtained for
+        free from the forward pass of the source-term gradient.
 
         :param serial_sites: names of latent sites to contract serially (memory-frugal);
             the gradient is taken through the serial loop.
@@ -213,7 +215,7 @@ class MPIW:
             for name, s in prep.sites.items()
             if not s.is_observed
         }
-        _, weights = contract_with_source_terms(
+        log_marginal, weights = contract_with_source_terms(
             lambda st: self._build_factors(prep, st),
             source_shapes,
             frozenset(serial_sites),
@@ -226,7 +228,16 @@ class MPIW:
             value = _squeeze_fillers(s.guide_value, d2n, s.guide_event_dim)
             weight = _squeeze_fillers(weights[name], d2n, 0)
             result[name] = (value, weight)
-        return result
+        return log_marginal, result
+
+    def site_weights(self, rng_key, *args, serial_sites=(), **kwargs):
+        """Return ``{site: (values, weights)}`` for each latent site.
+
+        See :meth:`log_marginal_and_site_weights`, whose weights this returns.
+        """
+        return self.log_marginal_and_site_weights(
+            rng_key, *args, serial_sites=serial_sites, **kwargs
+        )[1]
 
     def moments(self, rng_key, statistics, *args, serial_sites=(), **kwargs):
         """Posterior moments of per-site ``statistics``.
