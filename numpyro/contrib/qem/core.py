@@ -80,6 +80,16 @@ class QEM:
     :param float schedule_power: the power ``p`` of the default schedule; the
         paper's convergence guarantee needs ``0.5 < p <= 1``. Ignored when
         ``forget`` is given.
+    :param bool decorrelated_normalizer: normalize the E-step weights by
+        ``P_MP`` of a second, *independent* batch of guide samples (paper section
+        4) instead of the same-batch ``P_MP``. This removes the
+        numerator/denominator covariance term of the self-normalized moment
+        estimator's finite-``K`` ratio bias (the ``Var[P_MP]``-driven term
+        survives, by Jensen), at the cost of one extra guide trace + normalizer
+        contraction per step and of weights no longer summing to exactly one --
+        so per-step mean-parameter estimates gain variance and can momentarily
+        leave the mean domain (relevant for discrete families); the EMA damps
+        this. Defaults to False (self-normalized).
     :param serial_sites: latent sites whose ``K`` dimensions are contracted
         serially (memory-frugal path); see :class:`~numpyro.contrib.mpiw.MPIW`.
     :param int max_plate_nesting: optional; inferred from the guide if omitted.
@@ -92,6 +102,7 @@ class QEM:
         num_samples,
         forget=None,
         schedule_power=1.0,
+        decorrelated_normalizer=False,
         serial_sites=(),
         max_plate_nesting=None,
     ):
@@ -110,6 +121,7 @@ class QEM:
             if not 0.0 <= forget < 1.0:
                 raise ValueError(f"forget must be in [0, 1), got {forget}")
             self._forget = lambda t: forget
+        self.decorrelated_normalizer = decorrelated_normalizer
         self.serial_sites = tuple(serial_sites)
         self.max_plate_nesting = max_plate_nesting
 
@@ -153,9 +165,22 @@ class QEM:
             the convergence diagnostic).
         """
         rng_key, step_key = random.split(state.rng_key)
-        log_marginal, site_weights = self._mpiw(state).log_marginal_and_site_weights(
+        mpiw = self._mpiw(state)
+        log_marginal, site_weights = mpiw.log_marginal_and_site_weights(
             step_key, *args, serial_sites=self.serial_sites, **kwargs
         )
+        if self.decorrelated_normalizer:
+            # source-term weights are normalized by the same-batch P_MP; put it
+            # back and divide out the P_MP of an independent batch of proposals
+            rng_key, normalizer_key = random.split(rng_key)
+            log_normalizer = mpiw.log_marginal(
+                normalizer_key, *args, serial_sites=self.serial_sites, **kwargs
+            )
+            rescale = jnp.exp(log_marginal - log_normalizer)
+            site_weights = {
+                name: (values, weights * rescale)
+                for name, (values, weights) in site_weights.items()
+            }
 
         t = state.step + 1
         lam = self._forget(t)

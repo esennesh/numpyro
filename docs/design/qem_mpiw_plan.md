@@ -334,9 +334,19 @@ green + ruff clean):
   analytic evidence, prior-matched init, forget/schedule semantics + validation,
   non-EF rejection, reparameterization invariance (Thm 2, α = 1e-2 trajectories
   match to rtol 1e-8), SVI compatibility.
-- ⏳ Remaining: decorrelated-normalizer variant (§4 flag), PSIS k-hat diagnostics,
-  the QEM-vs-VI benchmark below, λ(t) reference against the paper's exact
-  constants once re-checked.
+- ✅ **Decorrelated-normalizer flag** (§4) — `QEM(decorrelated_normalizer=True)`:
+  E-step weights rescaled by `exp(log P_MP(z) − log P_MP(z′))` with `z′` a fresh
+  independent proposal batch (one extra guide trace + forward-only contraction).
+  Empirical check (scalar conjugate Normal, K=8, 200 seeds, one raw E-step from
+  the prior proposal): the flag *hurt* in both mismatch regimes tested — mild
+  (m1 bias −0.08, sd 0.32 self-normalized vs +0.40, sd 2.02 decorrelated) and
+  harsh (−0.82/0.70 vs +30/182; the `1/P_MP(z′)` factor is heavy-right-tailed,
+  consistent with the surviving Jensen term). As the plan suspected, "unbiased"
+  is too strong; the removed covariance term is smaller than the variance the
+  independent normalizer introduces, at least for from-prior proposals at small
+  K. Default stays off; benchmark should re-test in the adapted-proposal regime.
+- ⏳ Remaining: PSIS k-hat diagnostics, the QEM-vs-VI benchmark below, λ(t)
+  reference against the paper's exact constants once re-checked.
 
 - `QEM` class mirroring the `SVI` API surface (`init`/`update`/`run`), state = per-site
   mean-param pytrees + RNG key. No optax, no param store:

@@ -141,6 +141,35 @@ def test_discrete_latent_recovery():
     assert result.state.mean_params["z"]["x"] == pytest.approx(post_p, abs=0.03)
 
 
+def test_decorrelated_normalizer():
+    """Flag on: same conjugate recovery; weights actually get rescaled.
+
+    With the same rng key, the main proposal batch (and hence the raw
+    source-term weights) is identical in both variants, so any difference in
+    the first update comes exactly from the fresh-batch normalizer.
+    """
+    guide = AutoExponentialFamily(scalar_model)
+    qem = QEM(scalar_model, guide, num_samples=128, decorrelated_normalizer=True)
+    result = qem.run(random.PRNGKey(0), 60, progress_bar=False)
+
+    post_mean, post_var = scalar_posterior()
+    m = result.state.mean_params["z"]
+    assert m["x"] == pytest.approx(post_mean, abs=0.03)
+    assert m["xx"] - m["x"] ** 2 == pytest.approx(post_var, abs=0.05)
+
+    plain = QEM(scalar_model, guide, num_samples=32)
+    decorr = QEM(scalar_model, guide, num_samples=32, decorrelated_normalizer=True)
+    state = plain.init(random.PRNGKey(3))
+    plain_state, plain_lm = plain.update(state)
+    decorr_state, decorr_lm = decorr.update(state)
+    # same main batch: the reported log P_MP is identical...
+    np.testing.assert_allclose(plain_lm, decorr_lm)
+    # ...but the moment estimate is rescaled by P_MP(z) / P_MP(z')
+    assert not np.allclose(
+        plain_state.mean_params["z"]["x"], decorr_state.mean_params["z"]["x"]
+    )
+
+
 def test_forget_semantics():
     guide = AutoExponentialFamily(scalar_model)
 
