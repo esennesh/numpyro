@@ -113,6 +113,14 @@ from numpyro.distributions.distribution import (
     TransformedDistribution,
     Unit,
 )
+from numpyro.distributions.exp_family import (
+    base_distribution,
+    canonical_params,
+    from_mean_params,
+    is_exp_family,
+    mean_params,
+    sufficient_statistics,
+)
 from numpyro.distributions.kl import kl_divergence
 from numpyro.distributions.mixtures import Mixture, MixtureGeneral, MixtureSameFamily
 from numpyro.distributions.transforms import biject_to
@@ -131,9 +139,15 @@ from numpyro.distributions.truncated import (
 from . import constraints, transforms
 
 __all__ = [
+    "base_distribution",
     "biject_to",
+    "canonical_params",
     "constraints",
+    "from_mean_params",
+    "is_exp_family",
     "kl_divergence",
+    "mean_params",
+    "sufficient_statistics",
     "transforms",
     "AsymmetricLaplace",
     "AsymmetricLaplaceQuantile",
