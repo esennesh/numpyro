@@ -106,9 +106,32 @@ Note that Section~\ref{sec:goal} has already given up global optimality by choic
 
 Min-sum message passing is conventionally presented as an algorithm for tree-structured factor graphs, on the grounds that loops break it. That framing is misleading in both directions: min-sum remains exact on a class of loopy graphs, and where it does fail, it fails in ways that acyclicity is the wrong diagnostic for. This section establishes where the boundary actually lies.
 
+\subsection{The phenomenon in DAG-factorized models}
+\label{sec:dag_failures}
+
+Because the setting of this document is~\eqref{eq:factorization}, a product of conditionals, the primary evidence should live in that class rather than in the undirected pairwise models that are conventional in this literature. Table~\ref{tab:dag_failures} therefore reports max-product on random DAG-factorized models with general-arity factor nodes, one factor per conditional.
+
+\begin{table*}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}p{6.2cm}ccc@{}}
+        \toprule
+        \textbf{DAG-factorized model} & \textbf{Cyclomatic no.} & \textbf{Converged} & \textbf{Wrong decode} \\
+        \midrule
+        three latent children sharing a parent set, unfused & 2 & 11470/12000 & 15 \\
+        the same model, parallel factors fused              & 0 & 12000/12000 & 0 \\
+        $3\times3$ lattice DAG (parents above and left)     & 4 & 1152/1200   & 1 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Damped parallel max-product (damping $0.5$, residual tolerance $10^{-12}$) on random models built from normalized conditional probability tables over binary variables, against exhaustive enumeration. ``Wrong decode'' counts converged instances whose greedy decoding is not a maximiser. The first two rows are the same model with and without fusion of the three conditionals sharing a parent set, which is the transformation Section~\ref{sec:fusion} discusses; the fused row uses one factor over all five variables and the unfused row three factors over the child and its two parents. Reproduced by \texttt{soft\_map\_counterexample.py}.}
+    \label{tab:dag_failures}
+\end{table*}
+
+Two things follow. The failure phenomenon is not an artefact of undirected models with arbitrary potentials: it occurs in products of conditionals, which is the class we care about. And fusing parallel factors over a shared parent set eliminates it in that instance, which Section~\ref{sec:fusion} takes up.
+
 \subsection{Loops are not the obstruction; a second independent loop is}
 
-Table~\ref{tab:failure_rates} reports damped parallel max-product against exhaustive enumeration on random binary pairwise models, over graphs of increasing cyclomatic number.
+The mechanisms are easiest to exhibit on undirected pairwise models, which admit minimal instances and let the associated linear program be solved by hand. Table~\ref{tab:failure_rates} reports max-product on random binary pairwise models over graphs of increasing cyclomatic number. These are legitimate factor graphs and the mechanisms they display are real, but they are illustrations rather than instances of~\eqref{eq:factorization}; Table~\ref{tab:dag_failures} is what establishes the phenomenon in this document's setting.
 
 \begin{table*}[h]
     \centering
@@ -126,7 +149,9 @@ Table~\ref{tab:failure_rates} reports damped parallel max-product against exhaus
     \label{tab:failure_rates}
 \end{table*}
 
-Min-sum is exact on trees and on single-loop graphs, reproducing the analysis of~\citet{Weiss2000}, who showed that local propagation yields provably optimal MAP assignments on graphs with a single cycle even though the marginals it computes are wrong. Failures begin only at two independent cycles. Acyclicity is therefore sufficient for correctness but far from necessary, and restricting min-sum to tree-structured factor graphs gives up more than the algorithm requires.
+Min-sum is exact on trees and on single-loop graphs, reproducing the analysis of~\citet{Weiss2000}, who showed that local propagation yields provably optimal MAP assignments on graphs with a single cycle even though the marginals it computes are wrong. Failures appear only at two independent cycles. Acyclicity is therefore sufficient for correctness but far from necessary, and restricting min-sum to tree-structured factor graphs gives up more than the algorithm requires.
+
+Two cautions about how much to read into these counts. All the nonzero failure rates are well under one percent of decodable instances, so the difference between the last two rows is within sampling noise and no trend in cyclomatic number should be inferred from it; the load-bearing contrast is between exactly zero and nonzero. And zero failures over a finite sample is not a proof of correctness --- the tree and single-loop rows are consistent with~\citet{Weiss2000}'s analysis, which is what actually establishes them. What the table adds is that the boundary is where the theory says it is, and that beyond it the failures are rare rather than pervasive, which is precisely what makes them dangerous: a method that fails on one instance in a thousand, silently and confidently, will not be caught by spot-checking.
 
 \subsection{Three distinct failure modes past cyclomatic number one}
 
@@ -169,7 +194,7 @@ The ingredients catalogued in Tables~\ref{tab:existing_algorithms} and~\ref{tab:
 \begin{description}
     \item[Candidate sets.] Each site carries a finite set of candidate values. For finite sites this may be the full support. For continuous sites it is a particle set. For countable sites see Section~\ref{sec:countable}, which is where the design is weakest.
     \item[A temperature.] Contraction or message passing proceeds in the $T$-tempered semiring, with $\oplus_T(a,b) = T \log(e^{a/T} + e^{b/T})$ and $\otimes = +$. At $T = 1$ this is sum-product; as $T \rightarrow 0$ it becomes max-plus. \emph{This is the only place tempering enters.} Elimination orderings, adjoint passes, candidate sets, and refinement subroutines are all independent of $T$, which is the main economy the design buys.
-    \item[Recovery by adjoint.] Argmaxes and tempered marginals are read off the backward pass. Differentiating a maximum returns an indicator of its argmax~\citep{Danskin1967}, and the backward pass of a contraction \emph{is} the corresponding message-passing algorithm~\citep{Darwiche2003, Eisner2016}; at $T = 0$ it is precisely a Viterbi backtrace.
+    \item[Recovery by adjoint.] Argmaxes and tempered marginals are read off the backward pass. Differentiating a maximum returns an indicator of its argmax~\citep{Danskin1966}, and the backward pass of a contraction \emph{is} the corresponding message-passing algorithm~\citep{Darwiche2003, Eisner2016}; at $T = 0$ it is precisely a Viterbi backtrace. For the tempered semiring specifically, \citet{Mensch2018} give the differentiated $(\max,+)$ dynamic program and its smoothed variants explicitly.
     \item[Refinement.] The subroutines in Table~\ref{tab:updates} \emph{populate candidate sets}. They are not themselves the optimizer. Keeping them in this role is what lets a single algorithm span finite, countable and continuous sites: the subroutine varies with the sample space, the machinery above it does not.
     \item[Elitism.] The incumbent best assignment is always retained in each site's candidate set, which makes the incumbent objective nondecreasing (Appendix~\ref{sec:proofs}).
 \end{description}
@@ -209,6 +234,26 @@ The substrate above generalizes discrete particle variational inference~\citep{S
 Contract the fused graph in the $T$-tempered semiring under an optimized elimination ordering~\citep{Dechter1999}. At $T = 0$ this maximises \emph{jointly} over all $K^n$ combinations of candidates at cost $O(n K^{w+1})$, which is the qualitative gain over coordinate descent: it does not merely check single-site moves. With candidate sets equal to full supports it is exact at $O(n k^{w+1})$, so approximate and exact inference are one code path at different budgets rather than two regimes. The sum-product side supplies the certificate of Section~\ref{sec:certificate} directly, since $\mathcal{S}_T$ computed by the same contraction upper-bounds the maximum and decreases toward it as $T \rightarrow 0$, while the incumbent bounds it below. The bound certifies optimality over the represented candidate grid, and globally only when the candidate sets are complete --- a distinction worth stating plainly, since it is easy to overclaim.
 
 This is the engineering answer: fastest to a \emph{certified} result. It is also the one option that is not biologically plausible, and for a specific reason --- building clique tables over sets of non-neighbours violates criterion \emph{(i)}, and choosing an elimination order requires global knowledge of $G$.
+
+The concrete realization of A1 at $T = 1$ over particle candidate sets is massively parallel importance weighting, which draws $K$ samples per site and recovers posterior moments and marginals by differentiating the contraction~\citep{Bowyer2024}. That is worth stating precisely, because it is easy to over-read: a single forward contraction plus one adjoint pass eliminates iteration entirely, and with it every convergence pathology that afflicts A2 and A4 --- a real advantage. It does \emph{not} eliminate the dependence on $w$. Reverse-mode differentiation costs a constant factor times the forward pass, and the forward pass is the contraction, so the $K^{w+1}$ term is untouched; the exponent shows up in practice as the size of the intermediate tensors, which is why implementations need memory-frugal contraction schedules. Nor could any such scheme escape it: exact marginalization is \#P-hard and exact maximization NP-hard, so no single forward-backward pass is both exact and polynomial on high-treewidth models. \textbf{Automatic differentiation changes who writes the backward pass, not what the forward pass costs.}
+
+\subsection{Which direction do the bounds go?}
+\label{sec:bound_directions}
+
+If a bound on $\log Z_\theta$ is to be used for learning $\theta$ --- ascending a lower bound on the marginal likelihood, as in variational EM --- then its direction matters more than its tightness. The two soft outputs in Table~\ref{tab:algorithms} point opposite ways.
+
+\paragraph{A3 gives an upper bound, which is the wrong direction.} Perturbing the potentials with independent Gumbel noise on each site and taking the expected maximum yields $\log Z_\theta \leq \mathbb{E}\left[\max_{\mathbf{z}}\{\log \targetm{\theta}{\mathbf{z}} + \sum_i \varepsilon_i(z_i)\}\right]$~\citep{Hazan2012}: an upper bound, useful for certifying but not for learning. Worse, the practical form of A3 forfeits even that, because approximate max-product returns an assignment whose value \emph{under}-estimates the true perturbed maximum, so the computed quantity is a downward-biased estimate of an upper bound and bounds $\log Z_\theta$ in neither direction.
+
+\paragraph{The particle family gives a lower bound, and it is elementary.} Take the discrete particle variational family of~\citet{Saeedi2017}: $q = \sum_p w_p \dirac{\mathbf{z}_p}{\cdot}$ over a set of \emph{distinct} configurations. Optimizing $F_1$ over $w$ gives $w_p \propto \targetm{\theta}{\mathbf{z}_p}$, at which the bound collapses to
+\begin{align}
+    \label{eq:particle_bound}
+    \log \sum_p \targetm{\theta}{\mathbf{z}_p} &\;\leq\; \log Z_\theta,
+\end{align}
+which holds for the trivial reason that a sub-sum of nonnegative terms cannot exceed the whole sum. It is valid for \emph{any} particle set, nondecreasing as particles are added, and exact once the set covers the support.
+
+This is what makes an approximate EM scheme available. Run A2 or A3 purely as a proposal mechanism to harvest distinct high-scoring configurations, then ascend~\eqref{eq:particle_bound} in $\theta$; the resulting M-step is a $w_p$-weighted complete-data likelihood maximization, so the scheme is Viterbi-style EM softened over a particle set. Critically, validity of the bound requires \emph{nothing} of the mode-finder --- not convergence, not optimality, not even reasonableness --- which is exactly what makes it robust to A2's failure modes. A2 can oscillate, tie, or decode confidently wrongly, and~\eqref{eq:particle_bound} still bounds $\log Z_\theta$ from below.
+
+Two caveats. The particles must be \emph{deduplicated}: summing $\gamma_\theta$ over a repeated configuration double-counts it and the inequality fails, which is easy to violate when particles come from a stochastic proposal. And a mode-seeking proposal concentrates on modes, so in a high-entropy posterior the bound is loose, and a loose lower bound biases the learned $\theta$ in the usual way. Neither objection threatens validity, only quality.
 
 \subsection{A2: annealed max-product}
 
@@ -265,6 +310,19 @@ The upshot is that the assumption to state is not ``log-concave sites'' but ``lo
 
 \paragraph{The fallback.} The second option is to truncate the support and carry an explicit tail bound, which costs nothing in assumptions but makes every downstream guarantee conditional on the truncation.
 
+\section{Parallel-factor fusion is a dial, not a preprocessing step}
+\label{sec:fusion}
+
+Fusing parallel factors in the string-diagram representation~\citep{Sennesh2023} is available for any straight-line program, and it is tempting to read it as a preprocessing step that prepares a model for A1. It is better understood as a continuous dial between A2 and A1, with a free initial segment and a dominated far end.
+
+\paragraph{The free segment.} When several factors range over an \emph{identical} parent set --- several children of the same parents, the canonical parallel composition --- fusing them removes cycles from the factor graph at essentially no cost. Table~\ref{tab:dag_failures} shows the effect directly: three latent children sharing a parent set give a factor graph of cyclomatic number two on which max-product misdecodes, and fusing the three conditionals into one factor takes the cyclomatic number to zero and the failure count to zero. The cost is negligible because the fused children are conditionally independent given the shared parents, so the fused factor --- though of high arity --- is maximized coordinatewise in them; and the pre-fusion graph already had treewidth at least the size of the parent set, so $w$ is essentially unchanged. This segment of the dial is a genuine free lunch and should be applied by default.
+
+\paragraph{Where the dial stops helping.} Cycles arising from parent sets that \emph{overlap without coinciding} are untouched, because no two factors share a parent set and there is nothing to merge. The lattice DAG in Table~\ref{tab:dag_failures} has cyclomatic number four and is completely immune to fusion. Any causal model with lattice, or temporal-with-skip-connections, structure lies in this class, which is to say most of them.
+
+\paragraph{The far end is dominated.} Fusion can always be pushed until the model is a chain of composite variables, whose factor graph has cyclomatic number zero, on which min-sum is exact. But the composite variables then carry alphabet $k^{\text{layer width}}$, and a chain decomposition is a path decomposition, so the cost is exponential in pathwidth. Since $w \leq \mathrm{pathwidth}$ for every graph, \textbf{full fusion is strictly dominated by A1 under a good elimination ordering}: it computes the same exact answer at an equal or higher price. Complete fusion is therefore never a reason to prefer chain min-sum to a junction tree; it is the worst way to perform an exact contraction.
+
+The useful reading is that fusion trades cyclomatic number against contraction cost along a curve whose first steps are free and whose last steps are pointless. Fuse the identical-parent-set patterns always; past that, the question is not how much to fuse but whether to pay for A1 at all, or to accept A2's weaker guarantee.
+
 \section{Which assumptions to accept, and which problems to transform}
 \label{sec:transform}
 
@@ -280,7 +338,7 @@ The upshot is that the assumption to state is not ``log-concave sites'' but ``lo
 \subsection{Transform}
 
 \begin{itemize}
-    \item \textbf{Fuse parallel factors into a chain}~\citep{Sennesh2023}. This is a preprocessing step, not an aside: it is what determines the $w$ on which A1's cost depends, and it is available for any straight-line program.
+    \item \textbf{Fuse parallel factors}~\citep{Sennesh2023} --- see Section~\ref{sec:fusion}, which argues that this is not preprocessing at all but a dial between A2 and A1.
     \item \textbf{Choose an elimination ordering}~\citep{Dechter1999}, converting a loopy graph into an exact computation at cost $k^{w+1}$.
     \item \textbf{Condition on a cutset, and vectorize over the clampings.} A cutset $C$ is a set of nodes whose removal leaves a forest. Clamping $C$ to a joint assignment leaves a tree, on which exact min-sum costs $O(n k^2)$; maximising over all $k^{\lvert C \rvert}$ clampings is exact~\citep{Pearl1988}. Since $\lvert C \rvert \geq w$ always, this never beats a junction tree in serial time --- but it needs only $O(n k^2)$ \emph{memory}, one tree pass at a time, and the clamped subproblems are completely independent, so a vectorized map runs them concurrently and wall-clock time collapses to roughly one tree pass for as long as the batch fits in memory. At $w = 25$ a clique table with $2^{26}$ entries cannot be allocated, whereas a cutset of 12 binary variables is 4096 parallel tree passes. This is the loophole to reach for when memory rather than time is the binding constraint, which on accelerators it usually is; sampling a subset of clampings degrades it gracefully to an anytime method.
     \item \textbf{Decompose a loopy graph into a forest plus consensus}, which is what produces A4's dual bound and certificate~\citep{Wainwright2005}.
@@ -377,7 +435,17 @@ The headline is that per-sweep cost is polynomial in $K$ with an exponent set by
 
 \section*{Open questions}
 
-Three gaps are worth stating explicitly. First, the equivalence between LP tightness and max-product correctness is established for weighted matching~\citep{Sanghavi2007} but not in the generality in which Section~\ref{sec:minsum} invokes the pattern. Second, countable support at $T = 0$ (Section~\ref{sec:countable}) has no exact method: per-site log-concavity is free in an exponential family but is not closed under max-marginalization, so the method rests either on convolution-structured couplings --- where closure does hold --- or on a truncation bound. Characterizing the largest class of exponential-family couplings whose messages stay discretely convex is the most concrete open problem this document raises, and discrete convex analysis~\citep{Murota2003} is where the answer should be looked for. Third, no analysis here bounds the \emph{number of sweeps} to convergence for A2 or A3; the claim that joint updates need fewer sweeps than coordinatewise ones is argued structurally and observed empirically, not proved.
+Five gaps are worth stating explicitly.
+
+\textbf{Countable support at $T = 0$} (Section~\ref{sec:countable}) has no exact method, and is the gap that gates the choice among A1--A4. Per-site log-concavity is free in an exponential family but is not closed under max-marginalization, so the method rests either on convolution-structured couplings --- where closure does hold --- or on a truncation bound. Characterizing the largest class of exponential-family couplings whose messages stay discretely convex is the most concrete open problem here, and discrete convex analysis~\citep{Murota2003} is where the answer should be looked for.
+
+\textbf{The LP-tightness characterization} is established as an equivalence for weighted matching~\citep{Sanghavi2007} but not in the generality in which Section~\ref{sec:minsum} invokes the pattern.
+
+\textbf{How far parallel-factor fusion reaches} is only partly settled. Section~\ref{sec:fusion} shows that it removes cycles for free when parent sets coincide and not at all when they merely overlap, but gives no characterization of the intermediate cases, nor any bound on how much of a realistic model's cyclomatic number falls in the free segment. That question is worth settling empirically on real models before assuming either extreme.
+
+\textbf{Empirical scope.} Table~\ref{tab:dag_failures} establishes the failure phenomenon in DAG-factorized models, but only on two small families; the pairwise results in Table~\ref{tab:failure_rates} are illustrations from a larger class. Neither is a survey, and the failure rates are low enough that reliable rate estimates would need far more instances than reported.
+
+\textbf{Iteration counts.} No analysis here bounds the number of sweeps to convergence for A2 or A4; the claim that joint updates need fewer sweeps than coordinatewise ones is argued structurally and observed empirically, not proved.
 
 \bibliographystyle{plainnat}
 \bibliography{bibliography}

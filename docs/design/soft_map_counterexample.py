@@ -2,21 +2,26 @@
 # SPDX-License-Identifier: Apache-2.0
 
 """Reproduces the counterexamples in "Fast, Soft MAP Estimation in Loopy
-Graphical Models", Sections 3 and 4.9.
+Graphical Models", in the min-sum section and the countable-sites subsection.
 
-Four results, in the order they appear in the paper:
+Five results, in the order they appear in the paper:
 
-1. A failure-rate table over graphs of increasing cyclomatic number. Min-sum is
-   exact on trees and on single-loop graphs; failures begin at two independent
-   cycles.
-2. The frustrated triangle: a tied fixed point whose local-marginal-polytope LP
+1. DAG-factorized models -- the setting of equation (1) -- of increasing
+   cyclomatic number, including the parallel-factor pattern before and after
+   fusion. This is the primary evidence, because it lives in the class the
+   document is actually about.
+2. A failure-rate table over pairwise MRFs of increasing cyclomatic number.
+   These are minimal illustrations of the three failure modes rather than
+   instances of equation (1); min-sum is exact on trees and on single-loop
+   graphs, and failures begin at two independent cycles.
+3. The frustrated triangle: a tied fixed point whose local-marginal-polytope LP
    relaxation is loose (bound 3 against a true optimum of 2, with half-integral
    edge marginals), so no fixed point could have decoded correctly.
-3. An explicit K4 instance on which max-product converges to a confident but
+4. An explicit K4 instance on which max-product converges to a confident but
    wrong assignment.
-4. Evidence for Section 4.9: discrete log-concavity, which every standard count
-   exponential family enjoys per site, is not closed under max-marginalization,
-   though it is closed under (max, +) convolution.
+5. Discrete log-concavity, which every standard count exponential family enjoys
+   per site, is not closed under max-marginalization, though it is closed under
+   (max, +) convolution.
 
 Run with ``python3 soft_map_counterexample.py``. Requires numpy and scipy only.
 Numbers quoted in the paper are copied from this script's output.
@@ -216,6 +221,180 @@ def k4_confident_but_wrong():
     print(f"  true MAP           {argmaxes[0]} -> value {true_best:.2f}")
 
 
+# ---------------------------------------------------------------------------
+# DAG-factorized models: general-arity factor graphs built from conditionals.
+# This is the setting of equation (1); the pairwise routines above are not.
+# ---------------------------------------------------------------------------
+
+
+def log_cpt(rng, arity, k=2):
+    """A random ``log p(child | parents)``, normalized over the child axis."""
+    table = rng.normal(size=(k,) * arity) * 1.5
+    return table - np.log(np.exp(table).sum(axis=0, keepdims=True))
+
+
+def factor_graph_cyclomatic(n_vars, factors):
+    """Cyclomatic number of the bipartite factor graph."""
+    nodes = n_vars + len(factors)
+    edges = sum(len(variables) for variables, _ in factors)
+    return edges - nodes + 1
+
+
+def max_product_factor_graph(n_vars, factors, k=2, damping=DAMPING):
+    """Damped parallel max-product over a general-arity factor graph.
+
+    ``factors`` is a list of ``(variables, log_table)`` pairs whose table has
+    shape ``(k,) * len(variables)``. Returns the variable beliefs and the final
+    message residual.
+    """
+    to_factor = {}
+    to_variable = {}
+    for a, (variables, _) in enumerate(factors):
+        for v in variables:
+            to_factor[(v, a)] = np.zeros(k)
+            to_variable[(a, v)] = np.zeros(k)
+    neighbours = {
+        v: [a for a, (variables, _) in enumerate(factors) if v in variables]
+        for v in range(n_vars)
+    }
+
+    residual = np.inf
+    for _ in range(MAX_SWEEPS):
+        new_to_factor = {}
+        for v in range(n_vars):
+            for a in neighbours[v]:
+                total = np.zeros(k)
+                for b in neighbours[v]:
+                    if b != a:
+                        total = total + to_variable[(b, v)]
+                new_to_factor[(v, a)] = total - total.max()
+        new_to_variable = {}
+        for a, (variables, table) in enumerate(factors):
+            for v in variables:
+                extended = table.copy()
+                for axis, u in enumerate(variables):
+                    if u == v:
+                        continue
+                    shape = [1] * len(variables)
+                    shape[axis] = k
+                    extended = extended + new_to_factor[(u, a)].reshape(shape)
+                others = tuple(axis for axis, u in enumerate(variables) if u != v)
+                message = extended.max(axis=others) if others else extended
+                new_to_variable[(a, v)] = message - message.max()
+        residual = max(
+            max(np.abs(new_to_factor[key] - to_factor[key]).max() for key in to_factor),
+            max(
+                np.abs(new_to_variable[key] - to_variable[key]).max()
+                for key in to_variable
+            ),
+        )
+        to_factor = {
+            key: damping * to_factor[key] + (1 - damping) * new_to_factor[key]
+            for key in to_factor
+        }
+        to_variable = {
+            key: damping * to_variable[key] + (1 - damping) * new_to_variable[key]
+            for key in to_variable
+        }
+        if residual < TOL:
+            break
+
+    beliefs = []
+    for v in range(n_vars):
+        belief = np.zeros(k)
+        for a in neighbours[v]:
+            belief = belief + to_variable[(a, v)]
+        beliefs.append(belief - belief.max())
+    return np.array(beliefs), residual
+
+
+def factor_graph_score(x, factors):
+    return sum(table[tuple(x[u] for u in variables)] for variables, table in factors)
+
+
+def factor_graph_optimum(n_vars, factors, k=2):
+    return max(
+        factor_graph_score(x, factors)
+        for x in itertools.product(range(k), repeat=n_vars)
+    )
+
+
+def _parallel_factors(rng, fuse):
+    """Three latent children sharing the parent set {0, 1}, each with a likelihood.
+
+    Unfused, the three conditionals give the factor graph two independent cycles.
+    Fused into one factor over all five variables -- which is what parallel-factor
+    fusion does in the string-diagram representation -- the graph becomes a tree.
+    """
+    priors = [((0,), log_cpt(rng, 1)), ((1,), log_cpt(rng, 1))]
+    conditionals = [log_cpt(rng, 3) for _ in range(3)]
+    likelihoods = [rng.normal(size=(2,)) for _ in range(3)]
+    if not fuse:
+        factors = list(priors)
+        for offset, child in enumerate((2, 3, 4)):
+            factors.append(((child, 0, 1), conditionals[offset]))
+            factors.append(((child,), likelihoods[offset]))
+        return 5, factors
+    fused = np.zeros((2,) * 5)
+    for index in itertools.product(range(2), repeat=5):
+        i0, i1 = index[0], index[1]
+        fused[index] = sum(
+            conditionals[offset][index[2 + offset], i0, i1]
+            + likelihoods[offset][index[2 + offset]]
+            for offset in range(3)
+        )
+    return 5, priors + [((0, 1, 2, 3, 4), fused)]
+
+
+def _lattice_dag(rng, side=3):
+    """A ``side``-by-``side`` lattice DAG whose parents are the cells above and left.
+
+    No two conditionals share a parent set, so parallel-factor fusion has nothing
+    to merge, and the factor graph's cycles survive it untouched.
+    """
+    index = {(i, j): i * side + j for i in range(side) for j in range(side)}
+    factors = []
+    for i in range(side):
+        for j in range(side):
+            parents = []
+            if i > 0:
+                parents.append(index[(i - 1, j)])
+            if j > 0:
+                parents.append(index[(i, j - 1)])
+            factors.append(
+                (tuple([index[(i, j)]] + parents), log_cpt(rng, 1 + len(parents)))
+            )
+    return side * side, factors
+
+
+def dag_failure_rates(name, build, n_trials=1500, seed=0):
+    """Max-product failure rate on a family of DAG-factorized models."""
+    rng = np.random.default_rng(seed)
+    converged = tied = wrong = 0
+    cyclomatic = None
+    for _ in range(n_trials):
+        n_vars, factors = build(rng)
+        if cyclomatic is None:
+            cyclomatic = factor_graph_cyclomatic(n_vars, factors)
+        beliefs, residual = max_product_factor_graph(n_vars, factors)
+        if residual > 1e-9:
+            continue
+        converged += 1
+        if min(abs(b[0] - b[1]) for b in beliefs) < 1e-6:
+            tied += 1
+            continue
+        decoded = tuple(int(np.argmax(b)) for b in beliefs)
+        if (
+            factor_graph_score(decoded, factors)
+            < factor_graph_optimum(n_vars, factors) - 1e-9
+        ):
+            wrong += 1
+    print(
+        f"  {name:44s} cyclomatic={cyclomatic}  converged={converged}  "
+        f"tied={tied}  WRONG={wrong}"
+    )
+
+
 def _concave_sequence(seq, tol=1e-9):
     """Whether a real sequence has nonincreasing first differences."""
     s = np.asarray(seq, float)
@@ -290,11 +469,24 @@ def log_concavity_under_max_marginalization(n=60):
 
 
 if __name__ == "__main__":
-    print("\n1. Max-product failure rate by cyclomatic number")
-    print(
-        "   (damping %.1f, tol %.0e, random Gaussian pairwise potentials)\n"
-        % (DAMPING, TOL)
+    print("\n1. DAG-factorized models: the setting of equation (1)")
+    print(f"   (damping {DAMPING}, tol {TOL:.0e}, random normalized conditionals)\n")
+    print("   parallel factors over an identical parent set -- the fusion target:")
+    dag_failure_rates(
+        "three children sharing parents, UNFUSED",
+        lambda rng: _parallel_factors(rng, fuse=False),
+        n_trials=12000,
     )
+    dag_failure_rates(
+        "the same model, parallel factors FUSED",
+        lambda rng: _parallel_factors(rng, fuse=True),
+        n_trials=12000,
+    )
+    print("\n   overlapping but distinct parent sets -- nothing to fuse:")
+    dag_failure_rates("3x3 lattice DAG (parents above and left)", _lattice_dag, 1200)
+
+    print("\n2. Pairwise MRFs: failure rate by cyclomatic number")
+    print("   (minimal illustrations, not instances of equation (1))\n")
     failure_rates("path 0-1-2-3 (0 cycles)", 4, [(0, 1), (1, 2), (2, 3)])
     failure_rates("4-cycle (1 cycle)", 4, [(0, 1), (1, 2), (2, 3), (0, 3)])
     failure_rates(
@@ -302,12 +494,12 @@ if __name__ == "__main__":
     )
     failure_rates("K4 (3 cycles)", 4, K4_EDGES)
 
-    print("\n2. Frustrated triangle: tied fixed point, loose LP relaxation\n")
+    print("\n3. Frustrated triangle: tied fixed point, loose LP relaxation\n")
     frustrated_triangle_lp()
 
-    print("\n3. K4: converged, confident, and wrong\n")
+    print("\n4. K4: converged, confident, and wrong\n")
     k4_confident_but_wrong()
 
-    print("\n4. Log-concavity is not closed under max-marginalization\n")
+    print("\n5. Log-concavity is not closed under max-marginalization\n")
     log_concavity_under_max_marginalization()
     print()
