@@ -199,6 +199,22 @@ The ingredients catalogued in Tables~\ref{tab:existing_algorithms} and~\ref{tab:
     \item[Elitism.] The incumbent best assignment is always retained in each site's candidate set, which makes the incumbent objective nondecreasing (Appendix~\ref{sec:proofs}).
 \end{description}
 
+\subsection{The temperature is what makes the adjoint well-defined}
+\label{sec:smoothing}
+
+It is worth being precise about why the adjoint recovers anything, because the reason also explains what the temperature is for beyond softness.
+
+Collect the log-potential values into a vector $\eta$, one free coordinate per factor and per configuration of that factor's variables. This is the tabular overcomplete parameterization of a discrete graphical model as an exponential family, whose sufficient statistics are the configuration indicators. Its log-partition function is a log-sum-exp of functions linear in $\eta$ and therefore \emph{automatically} convex, with
+\begin{align}
+    \label{eq:mean_param}
+    \frac{\partial \log \normalizer{\ }{\eta}}{\partial \eta_a(y)} &= \Pr[z_a = y],
+\end{align}
+the standard identity that the gradient of a log-normalizer is the vector of mean parameters~\citep{WainwrightJordan2008}. No convexity needs to be assumed and no stationarity condition is solved: \eqref{eq:mean_param} is an identity, evaluated exactly in one backward pass. This is why the marginals fall out of differentiation rather than out of an inner optimization, and why nothing about the model beyond finiteness is required. Where the potentials came from is likewise irrelevant --- if a neural network emits $\eta$, the chain rule composes ordinary backpropagation through the network with~\eqref{eq:mean_param} through the contraction, and the message passing is unchanged.
+
+The temperature now has a second role. At $T > 0$ the tempered log-normalizer is strictly convex and smooth in $\eta$, so the adjoint is unique. At $T = 0$ it degenerates to $\max_{\mathbf{z}} \sum_a \eta_a(z_a)$, a maximum of linear functions: still convex for free, but only piecewise linear, and nondifferentiable exactly where two configurations tie. Those kinks are the same objects as the undecodable tied fixed points of Section~\ref{sec:minsum}, seen in the dual. Annealing $T \rightarrow 0$ is therefore not a heuristic but \textbf{smoothing with a vanishing smoothing parameter}, in the sense of the smoothed max operators of~\citet{Mensch2018} and the Fenchel--Young duality that generalizes them~\citep{Blondel2020}: the entropy term is a strongly convex regularizer whose strength is $T$, and its role is to make the argmax unique and the adjoint single-valued. Read this way, the whole $T$-family is one conjugate-duality statement --- the tempered log-normalizer is the conjugate of $T$ times the negative entropy over the marginal polytope, and at $T = 0$ it becomes that polytope's support function, whose subgradients are its vertices, which are exactly the MAP configurations.
+
+Two consequences worth stating. The strong convexity that buys differentiability belongs to the \emph{regularizer we choose}, not to the model, so no log-concavity assumption on $\gamma_\theta$ is involved anywhere in this subsection. And the adjoint is only ever as good as the forward pass: differentiating an exact contraction gives exact marginals, whereas differentiating a stochastic or truncated estimator of the log-normalizer gives an \emph{estimator} of the marginals, with the variance and bias that implies. Automatic differentiation is faithful to the computation actually performed and cannot supply exactness the forward pass did not have.
+
 Four algorithms sit on this substrate. We score them additionally on biological plausibility, against explicit criteria so that the claim is falsifiable: \emph{(i)} a unit consults only its Markov blanket; \emph{(ii)} updates are parallel, though mutex-serialized orderings are permitted; \emph{(iii)} at most one globally broadcast scalar, read as a neuromodulatory temperature; \emph{(iv)} no credit assignment \emph{across} the graph by a distinct backward pass --- gradients computed \emph{within} a site are permitted, on the premise that a cortical column can compute its own; \emph{(v)} noise is usable as a resource rather than only tolerated; \emph{(vi)} the representation is compatible with population codes.
 
 \begin{table*}[h]
