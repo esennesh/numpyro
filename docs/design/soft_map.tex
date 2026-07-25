@@ -1,0 +1,490 @@
+% Body of "Fast, Soft MAP Estimation in Loopy Graphical Models".
+%
+% Drop-in replacement for everything between \maketitle and \end{document} in
+% neurips_2026.tex. Requires only packages already in that preamble
+% (amsmath, amssymb, amsthm, bm, bbm, booktabs, pifont, semantic, xcolor,
+% importance) plus the \cmark/\xmark and theorem declarations already present.
+% Numbers in Section 3 are produced by docs/design/soft_map_counterexample.py.
+
+\begin{abstract}
+    This design document outlines a family of inference algorithm ingredients for fast, potentially soft, maximum-a-posteriori estimation in joint distributions of (potentially loopy) Bayesian networks and (potentially) factor graphs. The aim is to support finite, countably infinite, and continuous random variables. We first ask when min-sum message passing may be used in loopy graphs, and show that it is exact up to cyclomatic number one, exhibit explicit counterexamples beyond it, and argue that the operative condition is tightness of a linear-programming relaxation rather than acyclicity. We then organise the available algorithmic ingredients into four algorithms over a common substrate, scored on cost, guarantee, assumptions, and biological plausibility.
+\end{abstract}
+
+\section{Problem Statement}
+
+We consider a parametric $\sigma$-finite standard Borel measure space $(Z,\mathcal{B}(Z), \mu_{Z})$ (Definition~\ref{def:borel_measure_space}) and a measure $\mu: \Theta \times \mathcal{B}(Z) \rightarrow \extWeight$ over it that factorizes according to a directed acyclic graphical model with (unnormalized) density $\gamma: \Theta \times Z \rightarrow \weight$
+\begin{align}
+    \label{eq:factorization}
+    \targetm{\theta}{\mathbf{z}} &:= \prod_{z \in \mathbf{z}} \targetc{\theta}{z}{\parents{z}}.
+\end{align}
+This setting includes the joint densities, clamped by observations $\mathbf{x}$, employed in Bayesian inference
+\begin{align}
+    \targetm{\theta}{\mathbf{z}} &:= \priorm{\theta}{\mathbf{x}, \mathbf{z}} = \prod_{x \in \mathbf{x}} \priorc{\theta}{x}{\parents{x}} \prod_{z \in \mathbf{z}} \priorc{\theta}{z}{\parents{z}}.
+\end{align}
+In probabilistic programming terms, we are thus considering a ``straight-line'' or ``first order''~\citep{vandeMeent2021} probabilistic program, which admit transformation into a chain-style graph by fusing together parallel factors in their hypergraph, ``string diagram'' representation~\citep{Sennesh2023}. Section~\ref{sec:transform} treats this fusion as a named preprocessing step, since it is what controls the cost of everything that follows.
+
+We aim to exploit the graphical factorization of $\targetm{\theta}{\mathbf{z}}$ to efficiently estimate
+\begin{align*}
+    \mathbf{z}^{*} &:= \arg \max_{\mathbf{z}} \targetm{\theta}{\mathbf{z}} = \arg \min_{\mathbf{z}} \left[- \log \targetm{\theta}{\mathbf{z}}\right],
+\end{align*}
+or, where it is sufficiently cheap to do so, to account for uncertainty by approximating a ``soft'' (distributional) optimum whose mode should be a target mode.
+
+\subsection{What we are and are not asking for}
+\label{sec:goal}
+
+We want \emph{a} mode of the joint density, not necessarily the globally largest one. This is a deliberate weakening and it sets the axis along which the rest of this document is organised: not \emph{global versus local} optimality, but \textbf{joint versus coordinatewise} optimality. A point can be optimal in every single coordinate holding the others fixed while being jointly poor, and this is the characteristic failure of mean-field and coordinate-descent schemes. An algorithm that returns a point which no \emph{joint} move over a large neighbourhood can improve is what we are after, even when we cannot certify that no move at all would improve it. Section~\ref{sec:minsum} shows that message passing gives exactly this, over a neighbourhood far richer than the single-coordinate one.
+
+\subsection{Softness is a temperature}
+\label{sec:softness}
+
+A soft maximum of $\log \targetm{\theta}{\cdot}$ is a log-expected-exponential. Define, for temperature $T > 0$,
+\begin{align}
+    \label{eq:softmax}
+    \mathcal{S}_T(\theta) &:= T \log \int_Z \targetm{\theta}{\mathbf{z}}^{1/T} \, d\mu_Z(\mathbf{z}),
+    &\text{so that} \quad \lim_{T \rightarrow 0} \mathcal{S}_T(\theta) = \max_{\mathbf{z}} \log \targetm{\theta}{\mathbf{z}},
+\end{align}
+with $\mathcal{S}_T \geq \max_{\mathbf{z}} \log \targetm{\theta}{\mathbf{z}}$ for every $T > 0$ and $\mathcal{S}_T$ nonincreasing in $T$ (Appendix~\ref{sec:proofs}). The associated \emph{tempered target} is $\pi_T \propto \targetm{\theta}{\cdot}^{1/T}$, which concentrates on the modes of $\gamma_\theta$ as $T \rightarrow 0$ and equals the posterior at $T = 1$.
+
+One member of this family deserves a warning, because it is the natural thing to write down and it does not work. Since $\mathcal{S}_1 = \log Z_{\theta}$, it is tempting to estimate the $T = 1$ soft maximum by importance sampling from a variational proposal $\proposalm{\phi}{\cdot}$ and to optimise the result over $\phi$. But that quantity does not depend on $\phi$ at all:
+\begin{align}
+    \label{eq:degenerate}
+    \expect{\proposalm{\phi}{\mathbf{z}}}{\frac{\targetm{\theta}{\mathbf{z}}}{\proposalm{\phi}{\mathbf{z}}}} &= \int_Z \proposalm{\phi}{\mathbf{z}} \frac{\targetm{\theta}{\mathbf{z}}}{\proposalm{\phi}{\mathbf{z}}} \, d\mu_Z(\mathbf{z}) = \int_Z \targetm{\theta}{\mathbf{z}} \, d\mu_Z(\mathbf{z}) = Z_{\theta} .
+\end{align}
+Every proposal is optimal, and $-\log \expect{\proposalm{\phi}{\cdot}}{\targetm{\theta}{\cdot} / \proposalm{\phi}{\cdot}}$ therefore carries no signal about $\phi$ whatsoever. The proposal only affects the \emph{variance} of a finite-sample estimate of~\eqref{eq:degenerate}, not its target. What restores $\phi$-dependence is pushing the logarithm inside by Jensen's inequality, which turns the identity into a bound --- the evidence lower bound at $T = 1$, and its tempered analogue in general. Writing that bound as a free energy,
+\begin{align}
+    \label{eq:free_energy}
+    F_T(\phi) &:= \expect{\proposalm{\phi}{\mathbf{z}}}{- \log \targetm{\theta}{\mathbf{z}}} - T \, H\!\left[\proposalm{\phi}{\cdot}\right],
+\end{align}
+we recover the familiar energy-minus-entropy decomposition of the variational free energy, with $F_1 = -\mathrm{ELBO}$. Its minimiser over \emph{all} distributions is $\pi_T$, at which $\min_q F_T = -\mathcal{S}_T$ (Appendix~\ref{sec:proofs}). So:
+\begin{itemize}
+    \item the soft optimum is $\mathcal{S}_T$, attained by $\pi_T$;
+    \item the tractable surrogate is $F_T$, an upper bound on $-\mathcal{S}_T$ over a variational family;
+    \item $T$ is the single softness dial, with $T = 1$ ordinary variational inference and $T \rightarrow 0$ maximum-a-posteriori estimation.
+\end{itemize}
+Everything below inherits this one parameter. In particular ``soft MAP'' means ``approximate $\pi_T$ for small $T$'', not a separate algorithm. (Readers who prefer the R\'{e}nyi / $\alpha$-divergence presentation of variational bounds will recognise the degenerate case above as its $\alpha = 0$ member.)
+
+\subsection{Notation}
+\label{sec:notation}
+
+Table~\ref{tab:notation} fixes the symbols used throughout. Three of them carry most of the weight. The support size $k$ and the candidate count $K$ are distinguished because the algorithms below operate on a chosen subset of each site's support rather than on the support itself, and the gap between them is the difference between exact and approximate inference. The treewidth $w$ is the parameter every exact method's cost is exponential in, and Section~\ref{sec:transform} is largely concerned with how to make it smaller or sidestep it.
+
+\begin{table*}[h]
+    \centering
+    \begin{tabular}{cl}
+        \toprule
+        \textbf{Symbol} & \textbf{Meaning} \\
+        \midrule
+        $n$ & number of latent sites in $\mathbf{z}$ \\
+        $k$ & size of the full support of a finite site \\
+        $K$ & number of \emph{candidate} values retained per site ($K \leq k$ when subsetting) \\
+        $w$ & treewidth of the moralized graph \emph{after} parallel-factor fusion \\
+        $T$ & temperature; $T = 1$ sum-product, $T \rightarrow 0$ max-plus \\
+        $G$ & the factor graph; $\lvert E \rvert$ its number of edges \\
+        $L(G)$ & the local marginal polytope: normalized pseudomarginals, pairwise consistent \\
+        $M(G)$ & the marginal polytope: the convex hull of realizable configurations \\
+        $C$ & a cutset (feedback vertex set): nodes whose removal leaves a forest \\
+        $K_m$ & the complete graph on $m$ vertices \\
+        \bottomrule
+    \end{tabular}
+    \caption{Notation used throughout. Costs are quoted as $O(n K^{w+1})$ in general and $O(n k^{w+1})$ in the exact, full-support case.}
+    \label{tab:notation}
+\end{table*}
+
+\section{What is actually hard}
+\label{sec:hardness}
+
+Three facts bound what any algorithm here can promise.
+
+First, exact maximum-a-posteriori inference in \emph{discrete} Bayesian networks is NP-hard~\citep{Shimony1994}. Second, approximating it to within a constant factor is also NP-hard~\citep{Abdelbar1998}, so the hardness is not an artefact of demanding exactness. Third, for continuous $Z$, locating the global maximum of a nonconvex smooth density requires a number of evaluations exponential in $\dim Z$ in the worst case.
+
+Consequently no algorithm is simultaneously assumption-free, polynomial-time, and globally optimal. Every entry in the tables below gives up at least one of the three, and the useful question is not \emph{whether} an algorithm makes a concession but \emph{which} concession and \emph{whether we can measure the cost of it at runtime}. This is why Section~\ref{sec:minsum} ends up recommending a \emph{certificate} in place of an assumption wherever one is available: an assumption we cannot check is strictly worse than a bound we can compute.
+
+Note that Section~\ref{sec:goal} has already given up global optimality by choice, not by necessity. What follows is therefore less pessimistic than the hardness results alone suggest.
+
+\section{Min-sum in loopy graphs}
+\label{sec:minsum}
+
+Min-sum message passing is conventionally presented as an algorithm for tree-structured factor graphs, on the grounds that loops break it. That framing is misleading in both directions: min-sum remains exact on a class of loopy graphs, and where it does fail, it fails in ways that acyclicity is the wrong diagnostic for. This section establishes where the boundary actually lies.
+
+\subsection{Loops are not the obstruction; a second independent loop is}
+
+Table~\ref{tab:failure_rates} reports damped parallel max-product against exhaustive enumeration on random binary pairwise models, over graphs of increasing cyclomatic number.
+
+\begin{table*}[h]
+    \centering
+    \begin{tabular}{lcccc}
+        \toprule
+        \textbf{Graph} & \textbf{Independent cycles} & \textbf{Converged} & \textbf{Tied fixed point} & \textbf{Wrong decode} \\
+        \midrule
+        path on 4 nodes         & 0 & 3000/3000 & 0  & 0 \\
+        4-cycle                 & 1 & 3000/3000 & 51 & 0 \\
+        $K_4$ minus an edge     & 2 & 2846/3000 & 61 & 3 \\
+        $K_4$                   & 3 & 2756/3000 & 72 & 5 \\
+        \bottomrule
+    \end{tabular}
+    \caption{Damped parallel max-product (damping $0.5$, residual tolerance $10^{-12}$) on 3000 random instances per row with i.i.d.\ standard normal pairwise potentials and no unary terms. ``Tied'' counts converged instances with an exactly uniform belief at some node, which cannot be decoded. ``Wrong decode'' counts converged, untied instances whose greedy decoding is not a true maximiser. Reproduced by \texttt{soft\_map\_counterexample.py}.}
+    \label{tab:failure_rates}
+\end{table*}
+
+Min-sum is exact on trees and on single-loop graphs, reproducing the analysis of~\citet{Weiss2000}, who showed that local propagation yields provably optimal MAP assignments on graphs with a single cycle even though the marginals it computes are wrong. Failures begin only at two independent cycles. Acyclicity is therefore sufficient for correctness but far from necessary, and restricting min-sum to tree-structured factor graphs gives up more than the algorithm requires.
+
+\subsection{Three distinct failure modes past cyclomatic number one}
+
+\paragraph{Undecodable ties, with a loose relaxation behind them.} Take the frustrated triangle: three binary variables, $\theta_{ij}(x_i, x_j) = \mathbbm{1}[x_i \neq x_j]$ on each of the three edges. Every assignment leaves at least one edge unsatisfied, so the optimum is $2$. Max-product converges immediately to exactly uniform beliefs at all three nodes, and greedy decoding returns $(0,0,0)$ with value $0$. The reason is visible one level down: maximising the same objective over $L(G)$ instead of $M(G)$ gives an optimal value of $3$, attained at the half-integral point assigning mass $\nicefrac{1}{2}$ to each of the two disagreeing configurations on every edge. The relaxation is loose, so \emph{no} fixed point could have decoded correctly --- this is a property of the problem, not of the message schedule.
+
+\paragraph{Oscillation.} About 5\% of $K_4$ instances fail to converge at all, with damping already applied.
+
+\paragraph{Convergence to a confident, wrong assignment.} This is the case worth internalising, because no diagnostic based on convergence or belief sharpness detects it. On $K_4$ with
+\begin{align*}
+    \theta_{01} &= \begin{bmatrix}-0.9 & -1.2\\ 1.6 & -0.2\end{bmatrix}\!, &
+    \theta_{02} &= \begin{bmatrix}1.5 & -0.8\\ -2.5 & -0.8\end{bmatrix}\!, &
+    \theta_{03} &= \begin{bmatrix}-0.2 & 1.0\\ 0.1 & -0.8\end{bmatrix}\!, \\
+    \theta_{12} &= \begin{bmatrix}-2.1 & 2.0\\ -0.8 & -0.3\end{bmatrix}\!, &
+    \theta_{13} &= \begin{bmatrix}0.0 & -1.6\\ -0.9 & -0.8\end{bmatrix}\!, &
+    \theta_{23} &= \begin{bmatrix}-0.6 & 2.6\\ -0.1 & -2.5\end{bmatrix}\!,
+\end{align*}
+max-product converges in 61 sweeps to a residual of $6 \times 10^{-13}$, with node belief log-odds gaps of $4.8$, $1.8$, $4.0$ and $4.0$ nats --- maximally confident by any local measure. It decodes $(0,1,0,1)$, worth $2.30$. The true maximiser is $(1,0,1,0)$, worth $2.80$.
+
+\subsection{The operative condition is LP tightness, not acyclicity}
+
+All three failure modes are symptoms of one condition. Max-product's fixed points correspond to stationary points of the relaxation of the MAP problem from $M(G)$ to $L(G)$~\citep{Wainwright2005}. Trees satisfy $L(G) = M(G)$ trivially, which is why they are easy; but so do single-loop graphs, binary pairwise models with submodular potentials --- where graph cuts solve the problem exactly~\citep{Boykov2001} --- and weighted matching on bipartite graphs~\citep{Bayati2008}. For weighted matching the correspondence has been established as an equivalence: if the relaxation is tight, max-product converges to the correct answer, and if it is loose, max-product does not converge~\citep{Sanghavi2007}. We do not claim that equivalence in general, but it is the cleanest available statement of the pattern, and it recommends replacing an assumption on graph topology with a runtime check on the relaxation.
+
+Accordingly, Table~\ref{tab:existing_algorithms} gives min-sum's setting as \emph{LP-tight instances}: a strictly weaker condition than acyclicity and, more usefully, a \emph{checkable} one.
+
+\subsection{What min-sum does guarantee, and why that is what we wanted}
+
+Given the goal stated in Section~\ref{sec:goal}, the positive result matters more than the counterexamples. At any max-product fixed point, the decoded assignment is optimal over the \emph{single-loops-and-trees} neighbourhood: it cannot be improved by any perturbation confined to a subgraph containing at most one cycle per connected component~\citep{WeissFreeman2001}. That is a joint-optimality guarantee, it requires no assumption on $G$, and its neighbourhood is vastly larger than the single-coordinate neighbourhood certified by mean-field or coordinate descent. Min-sum in a loopy graph is thus best understood not as a broken exact algorithm but as \textbf{a joint-mode finder with a characterised neighbourhood}; the counterexamples above delimit that characterisation rather than refute it.
+
+\subsection{Buying a certificate instead of assuming tightness}
+\label{sec:certificate}
+
+Where a guarantee is genuinely needed, the relaxation can be exploited rather than assumed away. We are maximising over $\mathbf{z}$, so relaxing to $L(G)$ produces an \emph{upper} bound; by duality the relaxed problem's dual is a minimisation, so \emph{tightening} means descending in the dual, and adding constraints can only lower the bound further. Meanwhile any feasible assignment is a lower bound. This gives a two-sided, anytime picture: the dual descends from above, the incumbent rises from below, and when they meet we have \emph{proved} optimality for that instance without ever having assumed anything about $G$.
+
+Concretely, reweighted and convexified message passing schemes descend the dual monotonically --- sequential tree-reweighted message passing is guaranteed never to worsen its bound~\citep{Kolmogorov2006}, and block-coordinate schemes on the dual converge without step-size tuning~\citep{Globerson2007} --- and where a gap persists, clusters may be added to tighten the relaxation, selected so that each addition improves the dual~\citep{Sontag2008}. Compute is then spent only where the instance actually requires it.
+
+\section{One substrate, four algorithms}
+\label{sec:algorithms}
+
+The ingredients catalogued in Tables~\ref{tab:existing_algorithms} and~\ref{tab:updates} are not alternatives at the same level of description. They compose, and the composition has a fixed shape:
+\begin{description}
+    \item[Candidate sets.] Each site carries a finite set of candidate values. For finite sites this may be the full support. For continuous sites it is a particle set. For countable sites see Section~\ref{sec:countable}, which is where the design is weakest.
+    \item[A temperature.] Contraction or message passing proceeds in the $T$-tempered semiring, with $\oplus_T(a,b) = T \log(e^{a/T} + e^{b/T})$ and $\otimes = +$. At $T = 1$ this is sum-product; as $T \rightarrow 0$ it becomes max-plus. \emph{This is the only place tempering enters.} Elimination orderings, adjoint passes, candidate sets, and refinement subroutines are all independent of $T$, which is the main economy the design buys.
+    \item[Recovery by adjoint.] Argmaxes and tempered marginals are read off the backward pass. Differentiating a maximum returns an indicator of its argmax~\citep{Danskin1967}, and the backward pass of a contraction \emph{is} the corresponding message-passing algorithm~\citep{Darwiche2003, Eisner2016}; at $T = 0$ it is precisely a Viterbi backtrace.
+    \item[Refinement.] The subroutines in Table~\ref{tab:updates} \emph{populate candidate sets}. They are not themselves the optimizer. Keeping them in this role is what lets a single algorithm span finite, countable and continuous sites: the subroutine varies with the sample space, the machinery above it does not.
+    \item[Elitism.] The incumbent best assignment is always retained in each site's candidate set, which makes the incumbent objective nondecreasing (Appendix~\ref{sec:proofs}).
+\end{description}
+
+Four algorithms sit on this substrate. We score them additionally on biological plausibility, against explicit criteria so that the claim is falsifiable: \emph{(i)} a unit consults only its Markov blanket; \emph{(ii)} updates are parallel, though mutex-serialized orderings are permitted; \emph{(iii)} at most one globally broadcast scalar, read as a neuromodulatory temperature; \emph{(iv)} no credit assignment \emph{across} the graph by a distinct backward pass --- gradients computed \emph{within} a site are permitted, on the premise that a cortical column can compute its own; \emph{(v)} noise is usable as a resource rather than only tolerated; \emph{(vi)} the representation is compatible with population codes.
+
+\begin{table*}[h]
+    \centering
+    \footnotesize
+    \begin{tabular}{@{}p{1.45cm}p{2.65cm}p{2.65cm}p{2.75cm}p{2.65cm}@{}}
+        \toprule
+         & \textbf{A1 Contraction} & \textbf{A2 Annealed max-product} & \textbf{A3 Perturb-and-max-product} & \textbf{A4 Convexified MP} \\
+        \midrule
+        Method & junction tree, tempered semiring & damped parallel min-sum, $T \rightarrow 0$ & Gumbel-perturb unaries, run A2, repeat & reweighted messages, monotone dual \\
+        \addlinespace
+        Cost & $O(n K^{w+1})$ & $O(\lvert E \rvert K^2)$ per sweep & A2 $\times$ draws, parallel & $O(\lvert E \rvert K^2)$ per sweep \\
+        \addlinespace
+        Assumption & bounded $w$ & none & none & none \\
+        \addlinespace
+        Guarantee & exact over the grid; certified gap & SLT joint local optimality at fixed points & approximate joint samples; $\log Z_{\theta}$ bounds & monotone dual bound; certificate \\
+        \addlinespace
+        Soft output & tempered joint marginals, FFBS & beliefs at $T > 0$ & distinct joint modes across draws & tempered marginals \\
+        \addlinespace
+        Plausible & \xmark\ nonlocal & \cmark & \cmark\ noise-driven & \cmark\ given \emph{(ii)} \\
+        \bottomrule
+    \end{tabular}
+    \caption{Four algorithms over the common substrate of Section~\ref{sec:algorithms}. ``SLT'' abbreviates the single-loops-and-trees neighbourhood of~\citet{WeissFreeman2001}; ``FFBS'' is forward-filter backward-sample.}
+    \label{tab:algorithms}
+\end{table*}
+
+\subsection{Relation to discrete particle variational inference}
+
+The substrate above generalizes discrete particle variational inference~\citep{Saeedi2017}, which is the closest existing method and is attractive for the same reasons: it finds a mode, it quantifies uncertainty including multiple modes, and it rests on simple updates and importance weighting. It differs in two respects. Its particle updates are restricted to discrete enumeration and stochastic resampling, whereas the refinement layer above admits any subroutine from Table~\ref{tab:updates}, which is what extends the method past finite supports. More importantly its updates are coordinatewise, whereas contraction or message passing over the candidate sets optimises \emph{jointly} --- which by Section~\ref{sec:goal} is the whole point.
+
+\subsection{A1: tempered contraction over candidate sets}
+
+Contract the fused graph in the $T$-tempered semiring under an optimized elimination ordering~\citep{Dechter1999}. At $T = 0$ this maximises \emph{jointly} over all $K^n$ combinations of candidates at cost $O(n K^{w+1})$, which is the qualitative gain over coordinate descent: it does not merely check single-site moves. With candidate sets equal to full supports it is exact at $O(n k^{w+1})$, so approximate and exact inference are one code path at different budgets rather than two regimes. The sum-product side supplies the certificate of Section~\ref{sec:certificate} directly, since $\mathcal{S}_T$ computed by the same contraction upper-bounds the maximum and decreases toward it as $T \rightarrow 0$, while the incumbent bounds it below. The bound certifies optimality over the represented candidate grid, and globally only when the candidate sets are complete --- a distinction worth stating plainly, since it is easy to overclaim.
+
+This is the engineering answer: fastest to a \emph{certified} result. It is also the one option that is not biologically plausible, and for a specific reason --- building clique tables over sets of non-neighbours violates criterion \emph{(i)}, and choosing an elimination order requires global knowledge of $G$.
+
+\subsection{A2: annealed max-product}
+
+Run damped parallel min-sum while annealing $T \rightarrow 0$. Cost is $O(\lvert E \rvert K^2)$ per sweep with no dependence on $w$, and the guarantee at convergence is the neighbourhood optimality of Section~\ref{sec:minsum}. Annealing here plays the role it plays in deterministic annealing generally~\citep{Rose1998}: the objective is smooth and easy at high $T$ and the solution is tracked as it sharpens. A2 is best regarded as the shared core of A3 and A4 rather than a standalone recommendation, since alone it inherits the oscillation and tie failure modes documented above.
+
+\subsection{A3: perturb-and-max-product}
+
+Perturbing the potentials with noise and then maximising turns a mode-finder into a sampler~\citep{Papandreou2011}, and low-order perturbations additionally furnish bounds on $\log Z_{\theta}$~\citep{Hazan2012}. Crucially the maximisation need not be exact: running approximate max-product inside the perturbation loop yields a parallel, scalable scheme that outperformed Gibbs sampling and Gibbs-with-gradients by orders of magnitude on Ising models, and succeeded on an entangled graphical model where both failed to mix~\citep{LazaroGredilla2021}.
+
+A3 is the most interesting option here. It is fast, parallel, and assumption-free; it returns distinct \emph{joint} configurations across draws rather than per-site marginal spread, so it addresses the ``soft'' half of the problem without any variational optimisation; and it scores best on plausibility, since noise plus local competition is exactly the mechanism the criteria were written to admit.
+
+\subsection{A4: convexified message passing}
+
+Where a certificate is required and $w$ is not bounded, use the reweighted and cluster-tightening machinery of Section~\ref{sec:certificate}. This is the only option combining a monotone convergence guarantee with a computable optimality certificate under no assumption on $G$. Permitting mutex-serialized update orderings under criterion \emph{(ii)} admits the sequential schedules these methods need, so the option with the strongest guarantees is also biologically defensible --- a happier coincidence than one might expect.
+
+\subsection{Continuous sites: particle max-product is population coding}
+
+For continuous sites the candidate sets are particles and the messages are max-plus competitions among them, which is particle belief propagation~\citep{Ihler2009} in its $T \rightarrow 0$ limit, and closely related to nonparametric belief propagation~\citep{Sudderth2003}. Read as a mechanism, each unit holds a set of candidate values with associated activity levels and messages implement local competition among them --- a natural population-code reading, and the route by which continuous variables enter the plausible options at all under criterion \emph{(vi)}. Consistency improves with $K$ at a rate governed by the \emph{per-site} dimension rather than $\dim Z$, which is the concrete payoff of exploiting~\eqref{eq:factorization}.
+
+\subsection{Mixed models, and what a block is}
+\label{sec:blocks}
+
+Models mixing discrete and continuous sites are handled by \emph{blocks}. A block is a subset of the sites updated jointly while every site outside it is held fixed; the algorithm cycles over blocks. The natural decomposition for a mixed model uses two: all discrete sites in one block, updated by contraction or message passing as above, and all continuous sites in the other, updated by the appropriate inner optimizer from Table~\ref{tab:updates}. Cycling is monotone in the objective, since each block update can only improve it.
+
+Blocks are where the distinction of Section~\ref{sec:goal} does its work twice over. Within a block we want the update to be \emph{joint} across that block's sites rather than one site at a time --- this is exactly what the contraction buys on the discrete block, and what a multivariate optimizer rather than per-coordinate line search buys on the continuous one. Across blocks the scheme is unavoidably coordinatewise, so a fixed point of the cycle is guaranteed only to be optimal with respect to moves confined to a single block. Fewer, larger blocks therefore give a stronger guarantee at higher cost per update, which is the dial to turn when a fixed point looks suspicious.
+
+\subsection{A plausible floor}
+
+Locally-informed stochastic search over discrete states~\citep{Sun2023} --- each unit computing a local energy difference and updating stochastically --- is the most plausible option of all and belongs in the comparison as a baseline. Annealing alone is not enough: convergence to the global optimum under Gibbs sampling requires a logarithmic cooling schedule~\citep{Geman1984}, which is not a practical budget, and this is precisely why Section~\ref{sec:goal} asks only for a joint mode.
+
+\subsection{Countable sites are the weak cell}
+\label{sec:countable}
+
+Two mechanisms are available for countably infinite support. They are easily conflated and must be kept apart, because they act at different layers:
+\begin{itemize}
+    \item \textbf{Probability generating functions} perform \emph{exact} marginalization over integer latent variables, by nested automatic differentiation through high-order derivatives~\citep{Sheldon2018}. This is the message layer, and it involves no truncation and no relaxation.
+    \item \textbf{Analytic continuation of the CDF and its inverse} makes the sampling path $z = F^{-1}(u; \text{params})$ differentiable in the parameters, which is what permits a gradient-based local move. This is the refinement layer. For many standard families the continuation is exact rather than constructed --- the Poisson CDF via the regularized incomplete gamma function, the binomial via the incomplete beta --- and only where none exists must a smoothing be built and annealed away~\citep{Wagner2024}.
+\end{itemize}
+Separating them exposes a real seam. Generating functions are a sum-product technique and do \emph{not} transfer to max-plus, so countable support at $T = 0$ has no exact method, and the two ends of the temperature homotopy use different machinery. Two options remain.
+
+The first is to assume the message is discrete log-concave in its integer argument, meaning its first difference $\Delta(z) := \log m(z+1) - \log m(z)$ is nonincreasing. Then $\Delta$ changes sign at most once, so the mode is the least $z$ with $\Delta(z) \leq 0$ --- a monotone predicate, locatable by bracketing outward from any starting point by doubling and then bisecting, at $O(\log D)$ evaluations of $\Delta$, where $D$ is the distance from the starting point to the mode. No truncation bound is needed, and $D$ is small in practice because the previous iteration's mode is a good starting point.
+
+\paragraph{Per-site log-concavity comes free in an exponential family, and is not enough.} For a natural exponential family on $\mathbb{N}$ with sufficient statistic $T(z) = z$, the log density is $z\eta - A(\eta) + \log h(z)$, whose only nonlinear dependence on $z$ is the base measure $\log h(z)$. Since $\log h$ is concave for the Poisson, binomial, negative binomial and geometric families, log-concavity in $z$ holds at \emph{every} natural parameter: it is a property of the family, not of the current parameter value, so the local mode-finding step above is always safe.
+
+What max-product needs, however, is not log-concavity of each factor but closure of log-concavity under \emph{max-marginalization}, and that does not follow. In the continuous case it would: partial maximization of a jointly concave function is concave. On the integers it fails, and the reason is visible in the exponential-family parameterization itself. If the natural parameter is affine in the parent, $\eta(z') = \alpha z' + \beta$, the coupling term $\alpha z z'$ is bilinear, and
+\begin{align}
+    \max_{z'} \left[ \alpha z z' + \psi(z') \right] &= \psi^{*}(\alpha z), \qquad \psi(z') := -A(\alpha z' + \beta) + \text{incoming}(z')
+\end{align}
+is a concave conjugate of the concave function $\psi$ and hence \emph{convex} in $z$. The outgoing message is therefore concave-plus-convex, and is log-concave only when the site's own curvature dominates. Numerically, three of four Poisson-chain configurations in which every factor is log-concave in each argument separately produce a non-log-concave max-marginal; the accompanying script reports the offending second differences.
+
+\paragraph{Where it does survive.} If the factor couples parent and child by an increment, $z = z' + \varepsilon$, the message is a $(\max,+)$ convolution, and $(\max,+)$ convolution of concave sequences is concave. The proof is one line: a concave sequence is determined by its nonincreasing sequence of first differences, and the convolution's differences are the sorted merge of the two operands' differences, hence again nonincreasing (Appendix~\ref{sec:proofs}). This is exactly the branching, immigration and thinning structure of the integer population models that motivate countable latent variables in the first place~\citep{Sheldon2018}, so it is a natural class rather than a contrived one. More generally the closure properties needed here are those of M- and L-convex functions in discrete convex analysis, which \emph{are} closed under infimal convolution and partial minimization~\citep{Murota2003}; per-axis concavity alone is a strictly weaker condition and buys nothing.
+
+The upshot is that the assumption to state is not ``log-concave sites'' but ``log-concave sites \emph{and} convolution-structured --- or more generally discretely convex --- couplings''. That is a narrower assumption than it first appears, but a sharper and checkable one, and it is the honest boundary of what countable support at $T = 0$ can promise.
+
+\paragraph{The fallback.} The second option is to truncate the support and carry an explicit tail bound, which costs nothing in assumptions but makes every downstream guarantee conditional on the truncation.
+
+\section{Which assumptions to accept, and which problems to transform}
+\label{sec:transform}
+
+\subsection{Accept}
+
+\begin{itemize}
+    \item \textbf{Bounded treewidth after fusion}, and only for A1. This is the one unavoidable computational assumption in the design, and it is a dial --- cost $k^{w+1}$ --- rather than a binary condition.
+    \item \textbf{Log-concavity or local strong convexity} on a continuous block (Section~\ref{sec:blocks}), if we want the block update to reach that block's joint optimum rather than merely a stationary point of it. Failing that, settle for certified stationarity, verified by Hessian-vector products without forming a Hessian.
+    \item \textbf{Discrete log-concavity} for countable sites at $T = 0$, per Section~\ref{sec:countable}.
+    \item \textbf{Smoothability}, but only for the right failure mode. Structured convex nonsmoothness --- $\ell_1$ terms, box and simplex constraints, group norms --- calls for proximal methods, which have closed-form prox operators, no smoothing parameter, and no annealing schedule; this should be the default. Smoothing is for a different problem: discontinuity induced by branching on a latent variable, where the objective is not of the form smooth-plus-simple-prox and no usable prox operator exists. There, smooth the discontinuity and anneal the smoothing to zero, with convergence to stationary points of the \emph{unsmoothed} objective~\citep{Wagner2024}.
+\end{itemize}
+
+\subsection{Transform}
+
+\begin{itemize}
+    \item \textbf{Fuse parallel factors into a chain}~\citep{Sennesh2023}. This is a preprocessing step, not an aside: it is what determines the $w$ on which A1's cost depends, and it is available for any straight-line program.
+    \item \textbf{Choose an elimination ordering}~\citep{Dechter1999}, converting a loopy graph into an exact computation at cost $k^{w+1}$.
+    \item \textbf{Condition on a cutset, and vectorize over the clampings.} A cutset $C$ is a set of nodes whose removal leaves a forest. Clamping $C$ to a joint assignment leaves a tree, on which exact min-sum costs $O(n k^2)$; maximising over all $k^{\lvert C \rvert}$ clampings is exact~\citep{Pearl1988}. Since $\lvert C \rvert \geq w$ always, this never beats a junction tree in serial time --- but it needs only $O(n k^2)$ \emph{memory}, one tree pass at a time, and the clamped subproblems are completely independent, so a vectorized map runs them concurrently and wall-clock time collapses to roughly one tree pass for as long as the batch fits in memory. At $w = 25$ a clique table with $2^{26}$ entries cannot be allocated, whereas a cutset of 12 binary variables is 4096 parallel tree passes. This is the loophole to reach for when memory rather than time is the binding constraint, which on accelerators it usually is; sampling a subset of clampings degrades it gracefully to an anytime method.
+    \item \textbf{Decompose a loopy graph into a forest plus consensus}, which is what produces A4's dual bound and certificate~\citep{Wainwright2005}.
+    \item \textbf{Move between discrete and continuous per site, in both directions.} Relax to a smooth representation where gradients are needed; discretise to particles where $\gamma_\theta$ is multimodal or nonsmooth. The substrate of Section~\ref{sec:algorithms} permits mixing these site by site within one model.
+    \item \textbf{Reparameterize to improve geometry} before optimising, and \textbf{collapse conjugate sites analytically} to shrink the graph before contracting it.
+\end{itemize}
+
+\subsection{Samplers as mode-finders}
+
+Driving $T \rightarrow 0$ turns a sampler into a mode-finder. Simulated annealing is the classical instance~\citep{Geman1984}, deterministic annealing its variational counterpart~\citep{Rose1998}, and locally-informed discrete dynamics the modern discrete version~\citep{Sun2023}. For continuous targets the practical obstacle has been that annealed diffusion samplers presume a trained score or a well-chosen path; the dilation path removes this, interpolating from a Dirac to the target with scores available in closed form~\citep{Chehab2024}, which also supplies a principled schedule for the $T$ appearing throughout this document.
+
+\subsection{Mode-finders as samplers}
+
+The converse transformation perturbs the potentials and maximises, so that the randomness of the perturbation induces randomness in the argmax~\citep{Papandreou2011, Hazan2012}. Its practical form is A3, and its important property is that the inner maximisation may be approximate~\citep{LazaroGredilla2021}. Taken together with the previous subsection, softness is reachable from either direction --- a sampler pushed toward its modes, or a mode-finder shaken by noise --- and the two routes are independent, so a failure of one does not compromise the other.
+
+\section{Algorithmic options and inner-loop subroutines}
+\label{sec:existing_algorithms}
+
+Table~\ref{tab:existing_algorithms} collects the algorithms available for this problem alongside the subproblem each one leaves open, and Table~\ref{tab:updates} collects the subroutines those subproblems admit. A check-mark (\cmark) denotes subroutines that tend to reach a mode in bounded time; an \xmark\ denotes those that are inefficient or require inordinate tuning.
+
+\begin{table*}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}p{4.3cm}p{4.2cm}p{4.4cm}@{}}
+        \toprule
+        \textbf{Algorithm} & \textbf{Setting} & \textbf{Subproblem} \\
+        \midrule
+        Min-sum message passing & LP-tight instances & Inner optimization (joint) \\
+        Variable elimination & Any graph, cost $k^{w+1}$ & Elimination ordering \\
+        Dual decomposition, reweighted MP & Any graph; bound and certificate & Dual descent, cluster selection \\
+        Coordinate descent & General factor graphs & Inner optimization (coordinate) \\
+        Variational inference & General factor graphs & Expressive joint proposals \\
+        Annealed sampling & Continuous densities & Efficient sampling \\
+        Perturb-and-MAP & Any graph with a MAP oracle & Approximate maximization \\
+        Discrete particle VI & General factor graphs & Particle updates \\
+        \bottomrule
+    \end{tabular}
+    \caption{Algorithmic options for finding a joint mode of an unnormalized target density. Min-sum's setting is given as LP-tightness rather than acyclicity for the reasons established in Section~\ref{sec:minsum}: the weaker condition is the one that actually governs correctness, and unlike acyclicity it can be checked on the instance at hand.}
+    \label{tab:existing_algorithms}
+\end{table*}
+
+\begin{table*}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}p{3.1cm}p{2.3cm}p{3.6cm}p{3.8cm}@{}}
+        \toprule
+        \textbf{Subproblem} & \textbf{Hypothesis space} & \textbf{Potential} & \textbf{Subroutine} \\
+        \midrule
+        Inner optimization & Finite & Finite & Enumeration \cmark \\
+        Inner optimization & Countable & Countable, $T > 0$ & Generating functions \cmark \\
+        Inner optimization & Countable & Log-concave, $T = 0$ & Local integer search \cmark \\
+        Inner optimization & Countable & Smooth extension & Analytic continuation \cmark \\
+        Inner optimization & Euclidean & Smooth, high-dimensional & Quasi-Newton (L-BFGS) \cmark \\
+        Inner optimization & Euclidean & Smooth, ill-conditioned & Truncated Newton \cmark \\
+        Inner optimization & Euclidean & Structured nonsmooth & Proximal optimization \cmark \\
+        Inner optimization & Euclidean & Discontinuous (branching) & Smoothing, annealed \cmark \\
+        Inner optimization & Euclidean & Differentiable & Plain SGD \xmark \\
+        Expressive joint proposals & Euclidean & Continuous & Normalizing flows \xmark \\
+        Efficient sampling & Euclidean & Unimodal & Langevin samplers \xmark \\
+        Efficient sampling & Euclidean & Multimodal & Diffusion samplers, closed-form path \cmark \\
+        Efficient sampling & Countable & Discrete & SMC \xmark \\
+        Efficient sampling & Finite & Discrete & Wasserstein gradient flow \cmark \\
+        \bottomrule
+    \end{tabular}
+    \caption{Subroutines for inner-loop updates. The Euclidean rows are organised by memory and conditioning rather than by derivative order, since that is what determines tractability at scale: quasi-Newton methods with limited memory are the default, while truncated Newton --- conjugate gradients applied to the Newton system via Hessian-vector products~\citep{Nocedal2006} --- pays off only with preconditioning or stringent accuracy requirements, and forming a dense Hessian costs $O(d^3)$. The two nondifferentiable rows are separated by the \emph{source} of the nonsmoothness, which is what determines whether a prox operator exists; see Section~\ref{sec:transform}.}
+    \label{tab:updates}
+\end{table*}
+
+\section{Cost and guarantee by regime}
+\label{sec:complexity}
+
+\begin{table*}[h]
+    \centering
+    \small
+    \begin{tabular}{@{}p{4.1cm}p{3.7cm}p{5.1cm}@{}}
+        \toprule
+        \textbf{Regime} & \textbf{Cost} & \textbf{Guarantee} \\
+        \midrule
+        Finite, full support, bounded $w$ & $O(n k^{w+1})$ & exact joint maximum \\
+        Finite, full support, bounded $\lvert C \rvert$ & $O(n k^2)$ memory, $k^{\lvert C \rvert}$ parallel & exact joint maximum \\
+        Candidate sets, bounded $w$ & $O(n K^{w+1})$ per sweep & exact over the grid; certified gap \\
+        Any graph, reweighted MP & $O(\lvert E \rvert K^2)$ per sweep & monotone dual bound; certificate when tight \\
+        Any graph, max-product & $O(\lvert E \rvert K^2)$ per sweep & SLT joint local optimality \emph{if} it converges \\
+        Any graph, perturb-and-max-product & above $\times$ draws, parallel & approximate joint samples; $\log Z_{\theta}$ bounds \\
+        Continuous, log-concave block & superlinear local & block-joint optimum \\
+        Continuous, general block & superlinear local & certified stationarity \\
+        \bottomrule
+    \end{tabular}
+    \caption{What each regime costs and what it buys. Elitism (Section~\ref{sec:algorithms}) makes the incumbent nondecreasing in every row, under no assumption on $\gamma_\theta$ beyond measurability and finiteness.}
+    \label{tab:complexity}
+\end{table*}
+
+The headline is that per-sweep cost is polynomial in $K$ with an exponent set by a graph parameter we can partly choose --- via fusion, elimination ordering, or cutset selection --- while the number of sweeps stays small because updates are joint rather than coordinatewise. Where that exponent cannot be made small enough, A3 and A4 drop the dependence on $w$ entirely in exchange for weakening the guarantee from exactness to, respectively, approximate joint samples and a certified bound.
+
+\section*{Open questions}
+
+Three gaps are worth stating explicitly. First, the equivalence between LP tightness and max-product correctness is established for weighted matching~\citep{Sanghavi2007} but not in the generality in which Section~\ref{sec:minsum} invokes the pattern. Second, countable support at $T = 0$ (Section~\ref{sec:countable}) has no exact method: per-site log-concavity is free in an exponential family but is not closed under max-marginalization, so the method rests either on convolution-structured couplings --- where closure does hold --- or on a truncation bound. Characterizing the largest class of exponential-family couplings whose messages stay discretely convex is the most concrete open problem this document raises, and discrete convex analysis~\citep{Murota2003} is where the answer should be looked for. Third, no analysis here bounds the \emph{number of sweeps} to convergence for A2 or A3; the claim that joint updates need fewer sweeps than coordinatewise ones is argued structurally and observed empirically, not proved.
+
+\bibliographystyle{plainnat}
+\bibliography{bibliography}
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\newpage
+\appendix
+
+\section{Proofs and elementary facts}
+\label{sec:proofs}
+
+\begin{proposition}[The tempered log-integral is a soft maximum]
+\label{prop:softmax}
+Let $\gamma_\theta$ be measurable with $0 < \int_Z \gamma_\theta^{1/T} d\mu_Z < \infty$ for all $T \in (0, 1]$, and let $M := \max_{\mathbf{z}} \log \targetm{\theta}{\mathbf{z}}$ be attained. Then $\mathcal{S}_T \geq M$ for every $T > 0$, $\mathcal{S}_T$ is nondecreasing in $T$, and $\mathcal{S}_T \rightarrow M$ as $T \rightarrow 0$.
+\end{proposition}
+\begin{proof}
+Write $f := \log \gamma_\theta$. For the bound, restrict the integral to any set $A$ of positive measure on which $f \geq M - \epsilon$; then $\mathcal{S}_T \geq T \log \left( \mu_Z(A) e^{(M-\epsilon)/T} \right) = M - \epsilon + T \log \mu_Z(A)$, and letting $\epsilon \rightarrow 0$ gives $\mathcal{S}_T \geq M + T \log \mu_Z(A)$. Where $\mu_Z$ is a counting measure and the maximiser is an atom of unit mass, $\log \mu_Z(A) = 0$ and the bound $\mathcal{S}_T \geq M$ is immediate; in the continuous case it holds after normalizing $\mu_Z$ so that the maximising neighbourhood has mass at least one, which is a choice of units. Monotonicity in $T$ is H\"{o}lder's inequality applied to $\lVert e^{f} \rVert_{1/T}$, which is nonincreasing in the exponent $1/T$. For the limit, upper-bound $\int e^{f/T} d\mu_Z \leq e^{M/T} \mu_Z(\mathrm{supp}\, \gamma_\theta)$ whenever the support has finite measure, giving $\mathcal{S}_T \leq M + T \log \mu_Z(\mathrm{supp}\, \gamma_\theta) \rightarrow M$; combined with the lower bound this pins the limit. For infinite-measure support the same argument applies after splitting off a superlevel set of $f$, using $\sigma$-finiteness.
+\end{proof}
+
+The practical content of Proposition~\ref{prop:softmax} is that the \emph{same} contraction which computes a tempered partition function also computes an upper bound on the maximum we want, and that the bound tightens monotonically as we anneal. Together with any feasible assignment as a lower bound, this is the certificate invoked in Section~\ref{sec:certificate}, with the caveat recorded there: over candidate sets the bound refers to the represented grid, and becomes a statement about $Z$ itself only when the candidate sets are complete.
+
+\begin{proposition}[The tempered free energy is minimized by the tempered target]
+\label{prop:free_energy}
+Over all probability measures $q \ll \mu_Z$, the functional $F_T(q) = \expect{q}{-\log \gamma_\theta} - T H[q]$ is minimized at $\pi_T \propto \gamma_\theta^{1/T}$, with $\min_q F_T = -\mathcal{S}_T$.
+\end{proposition}
+\begin{proof}
+Write $F_T(q) = T \left( \expect{q}{\log \frac{q}{\gamma_\theta^{1/T}}} \right) = T \left( \mathrm{KL}\!\left[q \,\|\, \pi_T\right] - \log \int \gamma_\theta^{1/T} d\mu_Z \right) = T \, \mathrm{KL}\!\left[q \,\|\, \pi_T\right] - \mathcal{S}_T$. Since the divergence is nonnegative and vanishes only at $q = \pi_T$, the claim follows.
+\end{proof}
+
+At $T = 1$ this is the standard statement that minimizing the variational free energy is equivalent to minimizing divergence from the posterior, and that its minimum is $-\log Z_{\theta}$. The one-line generalization to arbitrary $T$ is what licenses treating maximum-a-posteriori estimation and variational inference as the two endpoints of a single homotopy rather than as separate problems.
+
+\begin{proposition}[$(\max,+)$ convolution preserves discrete concavity]
+\label{prop:convolution}
+Let $a, b: \mathbb{Z} \rightarrow \mathbb{R} \cup \{-\infty\}$ be concave sequences with interval support, meaning their first differences $\Delta a, \Delta b$ are nonincreasing where finite. Then $c(z) := \max_{z'} \left[ a(z') + b(z - z') \right]$ is concave.
+\end{proposition}
+\begin{proof}
+A concave sequence with interval support is recovered from its initial value and its nonincreasing difference sequence by summation. Sorting the multiset union $\Delta a \uplus \Delta b$ in nonincreasing order and summing yields a concave sequence $\tilde{c}$; we claim $\tilde{c} = c$ up to the additive constant $a(\cdot) + b(\cdot)$ at the left endpoints. Increasing $z$ by one requires distributing one additional unit between the two arguments, and the greedy choice --- assign it to whichever argument offers the larger next increment --- is optimal precisely because both difference sequences are nonincreasing, so no later unit could have used a discarded increment more profitably. Hence the increments of $c$ are the merged differences in nonincreasing order, and $c$ is concave.
+\end{proof}
+
+Proposition~\ref{prop:convolution} is what makes convolution-structured couplings safe for max-product on countable supports, as discussed in Section~\ref{sec:countable}. It does not extend to general couplings: bilinear coupling terms, which is what an affine natural-parameter link produces, turn partial maximization into a concave conjugation and hence yield a convex contribution to the outgoing message.
+
+\begin{proposition}[Elitism yields monotone convergence]
+\label{prop:elitism}
+Suppose each outer iteration $t$ produces candidate sets $\{S_i^{(t)}\}_{i=1}^n$ with $\hat{\mathbf{z}}^{(t-1)}_i \in S_i^{(t)}$ for every site $i$, where $\hat{\mathbf{z}}^{(t-1)}$ is the incumbent, and that $\hat{\mathbf{z}}^{(t)}$ is a maximizer of $\log \gamma_\theta$ over the product grid $\prod_i S_i^{(t)}$. Then $\log \targetm{\theta}{\hat{\mathbf{z}}^{(t)}}$ is nondecreasing in $t$, and if $\gamma_\theta$ is bounded above the sequence converges.
+\end{proposition}
+\begin{proof}
+By hypothesis $\hat{\mathbf{z}}^{(t-1)} \in \prod_i S_i^{(t)}$, so the maximum over that grid is at least $\log \targetm{\theta}{\hat{\mathbf{z}}^{(t-1)}}$. A nondecreasing sequence bounded above converges.
+\end{proof}
+
+Proposition~\ref{prop:elitism} assumes nothing about $\gamma_\theta$ beyond measurability and boundedness, and nothing at all about $G$. It is deliberately weak --- it promises convergence of the objective, not convergence to any particular kind of point --- but it is the only guarantee in this document that survives every combination of the choices above, and it costs one retained candidate per site. Note that it requires the inner maximization to be exact over the grid, which holds for A1 but not for A2 or A3; for those, retaining the incumbent still prevents the reported answer from degrading, since the incumbent is tracked outside the message passing.
+
+\section{Measure theory background}
+\label{sec:measure_theory}
+Measure theory studies ways of assigning a ``size'' to a set (beyond its cardinality); these can include count, length, volume, and probability. Definition~\ref{def:standard_borel_space} begins with a nice class of measurable spaces.
+\begin{definition}[Standard Borel space]
+\label{def:standard_borel_space}
+Let  $(X, T_X) \in Ob(\mathbf{Top})$ be a separable complete metric space or homeomorphic to one. Equipping $X$ with its Borel $\sigma$-algebra $\mathcal{B}(X)$ generated by complements, countable unions, and countable intersections of open subsets $U \in T$ yields a \emph{standard Borel space} $(X, \mathcal{B}(X))$, which is also a measurable space.
+\end{definition}
+The paper uses standard Borel spaces as a basis for its category of measure spaces (Definition~\ref{def:borel_measure_space}).
+\begin{definition}[$\sigma$-finite standard Borel measure space]
+\label{def:borel_measure_space}
+The $\sigma$-finite \emph{standard Borel} measure spaces are freely generated by finite direct products $\otimes$ and countable direct sums of the counting-measured singleton space $(\mathbbm{1}, \mathcal{B}(\mathbbm{1}), \mu_{\#})$ and the Lebesgue-measured reals $(\mathbb{R}, \mathcal{B}(\mathbb{R}), \lambda)$.
+\end{definition}
+Example~\ref{ex:unit_interval} is such a space.
+\begin{example}[The unit interval]
+\label{ex:unit_interval}
+The closed unit interval $[0, 1]$ with its Borel $\sigma$-algebra of open sets $\mathcal{B}(0, 1)$ forms a standard Borel space $([0, 1], \mathcal{B}(0, 1))$.
+\end{example}
+Having a category of measurable spaces and some nice examples, Definition~\ref{def:measure} formally defines what it means to assign a ``size'' to a measurable set.
+\begin{definition}[Measure]
+\label{def:measure}
+A \emph{measure} on a measurable space $(Z, \Sigma_Z)$ is a function $\mu: \Sigma_Z \rightarrow \extWeight$ that is null on the empty set ($\mu(\emptyset) = 0$) and countably additive over pairwise disjoint sets
+\begin{align*}
+    \inference{
+        \{\sigma_k \in \Sigma_Z\}_{k\in\mathbb{N}}
+        \forall k\in\mathbb{N}, n\in\mathbb{N}, n \neq k \implies \sigma_k \cap \sigma_n = \emptyset
+    }{
+        \mu\left( \bigcup_{k \in \mathbb{N}} \sigma_k \right) = \sum_{k\in\mathbb{N}} \mu(\sigma_k)
+    }
+\end{align*}
+\end{definition}
+Definition~\ref{def:measure_space} below formally defines measure spaces, which the paper uses in the specific form of standard Borel measure spaces (Definition~\ref{def:borel_measure_space}).
+\begin{definition}[Measure space]
+\label{def:measure_space}
+A \emph{measure space} is a pair $((X, \Sigma_X), \mu)$ of a measurable space $(X, \Sigma_X)$ with a measure $\mu: \Sigma_Z \rightarrow \extWeight$ on that space.
+\end{definition}
+Definition~\ref{def:measure_kernel} defines maps from parameter spaces into measure spaces.
+\begin{definition}[Measure kernel]
+\label{def:measure_kernel}
+A \emph{measure kernel} between measurable spaces $(Z, \Sigma_Z), (X, \Sigma_X)$ is a function $f: Z \times \Sigma_X \rightarrow \extWeight$ such that $\forall z\in Z, f(z, \cdot)$ is a measure and $\forall \sigma_X \in \Sigma_X, f(\cdot, \sigma_X)$ is measurable.
+\end{definition}
+Definition~\ref{def:markov_kernel} specializes to measure kernels yielding only normalized probability measures.
+\begin{definition}[Markov kernel]
+\label{def:markov_kernel}
+A \emph{Markov kernel} is a measure kernel $f: Z \times \Sigma_X \rightarrow \extWeight$ whose measure is a probability measure so that $\forall z\in Z, f(z, \cdot): \Prob{X}$ and $\forall z\in Z, f(z, X) = 1$.
+\end{definition}
+Describing densities requires the Radon-Nikodym Theorem, which determines when probability measures have densities. The next two definitions give the Theorem's conditions, which must be satisfied for a density to exist.
+
+Definition~\ref{def:sigma_finite} will formalize the condition that both the base measure and a probability measure consist of sums over countable partitions of the sample space.
+\begin{definition}[$\sigma$-finite measure kernel]
+\label{def:sigma_finite}
+A \emph{$\sigma$-finite measure kernel} $f: Z \times \Sigma_X \rightarrow \extWeight$ is a measure kernel which at every parameter $z \in Z$ splits its codomain into countably many measurable sets $X = \bigcup_{n \in \mathbb{N}} X_n \in \Sigma_X$, each of which has finite measure $f(z)(X_n) < \infty$.
+\end{definition}
+Definition~\ref{def:absolute_continuity} will now formalize the further requirement that for a probability measure to admit a density function, it must have only the same null-sets as the underlying base measure.
+\begin{definition}[Absolute continuity]
+\label{def:absolute_continuity}
+One $\sigma$-finite measure kernel $f: Z \times \Sigma_X \rightarrow [0, \infty]$ is \emph{absolutely continuous} ($f \ll g$) with respect to another $\sigma$-finite measure kernel over the same codomain $g: Y \times \Sigma_X \rightarrow [0, \infty]$ when $\forall z\in Z, y\in Y, \sigma_X \in \Sigma_X, g(y)(\sigma_X) = 0 \implies f(z)(\sigma_X) = 0$.
+\end{definition}
+The conditions in Definition~\ref{def:sigma_finite} and Definition~\ref{def:absolute_continuity} are necessary and sufficient for the existence of a probability density via the Radon-Nikodym Theorem.
