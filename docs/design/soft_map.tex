@@ -196,7 +196,7 @@ The ingredients catalogued in Tables~\ref{tab:existing_algorithms} and~\ref{tab:
     \item[A temperature.] Contraction or message passing proceeds in the $T$-tempered semiring, with $\oplus_T(a,b) = T \log(e^{a/T} + e^{b/T})$ and $\otimes = +$. At $T = 1$ this is sum-product; as $T \rightarrow 0$ it becomes max-plus. \emph{This is the only place tempering enters.} Elimination orderings, adjoint passes, candidate sets, and refinement subroutines are all independent of $T$, which is the main economy the design buys.
     \item[Recovery by adjoint.] Argmaxes and tempered marginals are read off the backward pass. Differentiating a maximum returns an indicator of its argmax~\citep{Danskin1966}, and the backward pass of a contraction \emph{is} the corresponding message-passing algorithm~\citep{Darwiche2003, Eisner2016}; at $T = 0$ it is precisely a Viterbi backtrace. For the tempered semiring specifically, \citet{Mensch2018} give the differentiated $(\max,+)$ dynamic program and its smoothed variants explicitly.
     \item[Refinement.] The subroutines in Table~\ref{tab:updates} \emph{populate candidate sets}. They are not themselves the optimizer. Keeping them in this role is what lets a single algorithm span finite, countable and continuous sites: the subroutine varies with the sample space, the machinery above it does not.
-    \item[Elitism.] The incumbent best assignment is always retained in each site's candidate set, which makes the incumbent objective nondecreasing (Appendix~\ref{sec:proofs}).
+    \item[Elitism.] The incumbent best assignment is always retained in each site's candidate set, which makes the incumbent objective nondecreasing at fixed $\theta$ (Appendix~\ref{sec:proofs}; Section~\ref{sec:learning} qualifies this once $\theta$ is being learned).
 \end{description}
 
 \subsection{The temperature is what makes the adjoint well-defined}
@@ -270,6 +270,19 @@ which holds for the trivial reason that a sub-sum of nonnegative terms cannot ex
 This is what makes an approximate EM scheme available. Run A2 or A3 purely as a proposal mechanism to harvest distinct high-scoring configurations, then ascend~\eqref{eq:particle_bound} in $\theta$; the resulting M-step is a $w_p$-weighted complete-data likelihood maximization, so the scheme is Viterbi-style EM softened over a particle set. Critically, validity of the bound requires \emph{nothing} of the mode-finder --- not convergence, not optimality, not even reasonableness --- which is exactly what makes it robust to A2's failure modes. A2 can oscillate, tie, or decode confidently wrongly, and~\eqref{eq:particle_bound} still bounds $\log Z_\theta$ from below.
 
 Two caveats. The particles must be \emph{deduplicated}: summing $\gamma_\theta$ over a repeated configuration double-counts it and the inequality fails, which is easy to violate when particles come from a stochastic proposal. And a mode-seeking proposal concentrates on modes, so in a high-entropy posterior the bound is loose, and a loose lower bound biases the learned $\theta$ in the usual way. Neither objection threatens validity, only quality.
+
+\subsection{Learning \texorpdfstring{$\theta$}{theta} argues for particle contraction}
+\label{sec:learning}
+
+Once $\theta$ is estimated rather than given, three requirements introduced separately turn out to want the same data structure --- weighted per-site particle sets. The sampling ingredient of Section~\ref{sec:countable} produces per-site candidate sets. The lower bound~\eqref{eq:particle_bound} that makes learning possible is a sum over particles. And correcting for the fact that $\gamma_\theta$ \emph{moves} as $\theta$ is updated is done by carrying importance weights on particles, which is the Jarzynski construction: reweight each particle by the incremental log-ratio of the new target to the old, exactly as in sequential Monte Carlo, so that gradients stay correct under a drifting target rather than relying on the uncontrolled approximation of contrastive divergence~\citep{Carbone2023}. Three independent needs converging on one representation is the strongest argument in this document for taking some form of particle contraction as the spine, and it is an architectural argument rather than a claim about speed.
+
+\paragraph{The two loops use different semirings.} Importance weights live in sum-product; there is no meaningful way to weight a maximum. At $T \rightarrow 0$ weights are irrelevant and one simply retains the best candidate. So Jarzynski reweighting corrects the \emph{learning} loop while elitism drives the \emph{mode-finding} loop, and the nonstationarity correction is not needed for the MAP readout at all --- a mode-finder does not care that $\theta$ moved, it re-optimizes.
+
+\paragraph{Monotonicity becomes per-step.} Proposition~\ref{prop:elitism} holds at fixed $\gamma_\theta$. When $\theta$ moves the incumbent's objective value moves with it, so the guarantee survives only \emph{within} each $\theta$-step: re-evaluate the incumbent under the new $\theta$ --- one density evaluation --- and claim monotonicity from there. Nothing in this document licenses a monotone incumbent across a learning trajectory.
+
+\paragraph{What the reweighting actually protects against.} Bias under a drifting target is the stated motivation, but the sharper one is a failure mode of the coupled loops. Retaining an incumbent across $\theta$-updates while simultaneously fitting $\theta$ to make retained particles likely is self-reinforcing: $\theta$ moves to explain the incumbent, the incumbent stays best, and exploration stops. Keeping a \emph{spread} of weighted particles rather than a single incumbent is what prevents the learning loop from consuming the mode-finder, which is a better reason to carry weights than the bias correction alone.
+
+\paragraph{Two weightings, not one.} The deterministic bound~\eqref{eq:particle_bound} is attained at $w_p \propto \targetm{\theta}{\mathbf{z}_p}$ over deduplicated configurations; the Jarzynski weights are accumulated-work weights giving an unbiased normalizer estimate. Same particles, different weights, different purposes --- substituting one for the other forfeits the bound. And the reweighting carries the usual sequential Monte Carlo cost: as $\theta$ drifts the weights concentrate, so effective sample size needs monitoring and resampling, which reintroduces one level down the same diversity question the weights were introduced to solve.
 
 \subsection{A2: annealed max-product}
 
@@ -457,7 +470,7 @@ Table~\ref{tab:existing_algorithms} collects the algorithms available for this p
         Continuous, general block & superlinear local & certified stationarity \\
         \bottomrule
     \end{tabular}
-    \caption{What each regime costs and what it buys. Elitism (Section~\ref{sec:algorithms}) makes the incumbent nondecreasing in every row, under no assumption on $\gamma_\theta$ beyond measurability and finiteness.}
+    \caption{What each regime costs and what it buys. Elitism (Section~\ref{sec:algorithms}) makes the incumbent nondecreasing in every row at fixed $\theta$, under no assumption on $\gamma_\theta$ beyond measurability and finiteness; Section~\ref{sec:learning} treats the case where $\theta$ moves.}
     \label{tab:complexity}
 \end{table*}
 
@@ -528,7 +541,7 @@ Suppose each outer iteration $t$ produces candidate sets $\{S_i^{(t)}\}_{i=1}^n$
 By hypothesis $\hat{\mathbf{z}}^{(t-1)} \in \prod_i S_i^{(t)}$, so the maximum over that grid is at least $\log \targetm{\theta}{\hat{\mathbf{z}}^{(t-1)}}$. A nondecreasing sequence bounded above converges.
 \end{proof}
 
-Proposition~\ref{prop:elitism} assumes nothing about $\gamma_\theta$ beyond measurability and boundedness, and nothing at all about $G$. It is deliberately weak --- it promises convergence of the objective, not convergence to any particular kind of point --- but it is the only guarantee in this document that survives every combination of the choices above, and it costs one retained candidate per site. Note that it requires the inner maximization to be exact over the grid, which holds for A1 but not for A2 or A3; for those, retaining the incumbent still prevents the reported answer from degrading, since the incumbent is tracked outside the message passing.
+Proposition~\ref{prop:elitism} assumes nothing about $\gamma_\theta$ beyond measurability and boundedness, and nothing at all about $G$ --- but it does hold $\theta$ fixed, and Section~\ref{sec:learning} explains why that matters once $\theta$ is being learned. It is deliberately weak --- it promises convergence of the objective, not convergence to any particular kind of point --- but it is the only guarantee in this document that survives every combination of the choices above, and it costs one retained candidate per site. Note that it requires the inner maximization to be exact over the grid, which holds for A1 but not for A2 or A3; for those, retaining the incumbent still prevents the reported answer from degrading, since the incumbent is tracked outside the message passing.
 
 \section{Measure theory background}
 \label{sec:measure_theory}
