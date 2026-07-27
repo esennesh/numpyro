@@ -4,7 +4,7 @@
 """Reproduces the counterexamples in "Fast, Soft MAP Estimation in Loopy
 Graphical Models", in the min-sum section and the countable-sites subsection.
 
-Five results, in the order they appear in the paper:
+Six results, in the order they appear in the paper:
 
 1. DAG-factorized models -- the setting of equation (1) -- of increasing
    cyclomatic number, including the parallel-factor pattern before and after
@@ -22,6 +22,10 @@ Five results, in the order they appear in the paper:
 5. Discrete log-concavity, which every standard count exponential family enjoys
    per site, is not closed under max-marginalization, though it is closed under
    (max, +) convolution.
+6. A negative result on discrete convex analysis: the factors are not
+   M-natural-concave, and neither is the convolution-structured case whose
+   (max, +) closure is provable, so that condition is sufficient for the closure
+   at issue but not necessary.
 
 Run with ``python3 soft_map_counterexample.py``. Requires numpy and scipy only.
 Numbers quoted in the paper are copied from this script's output.
@@ -468,6 +472,99 @@ def log_concavity_under_max_marginalization(n=60):
         )
 
 
+_UNIT = [np.array([1, 0]), np.array([0, 1])]
+
+
+def m_natural_concave(name, g, domain=None, side=12, tol=1e-9):
+    """Check the M-natural-concave exchange property for ``g`` on a finite box.
+
+    For a concave-type ``g`` the property requires, for every pair of domain
+    points ``x, y`` and every coordinate ``i`` with ``x[i] > y[i]``::
+
+        g(x) + g(y) <= max( g(x-e_i) + g(y+e_i),
+                            max over j with x[j] < y[j] of
+                                g(x-e_i+e_j) + g(y+e_i-e_j) )
+
+    Only pairs whose required neighbours lie inside the domain are checked, so a
+    reported violation is never a boundary artefact. ``domain`` is a predicate on
+    the two coordinates; the default admits the whole box.
+    """
+    if domain is None:
+
+        def domain(a, b):
+            return True
+
+    def inside(p):
+        return 0 <= p[0] < side and 0 <= p[1] < side and domain(p[0], p[1])
+
+    points = [
+        np.array(p) for p in itertools.product(range(side), repeat=2) if domain(*p)
+    ]
+    violations = checked = 0
+    worst = 0.0
+    for x in points:
+        for y in points:
+            for i in (0, 1):
+                if x[i] <= y[i]:
+                    continue
+                if not (inside(x - _UNIT[i]) and inside(y + _UNIT[i])):
+                    continue
+                best = g(*(x - _UNIT[i])) + g(*(y + _UNIT[i]))
+                for j in (0, 1):
+                    if x[j] >= y[j]:
+                        continue
+                    p, q = x - _UNIT[i] + _UNIT[j], y + _UNIT[i] - _UNIT[j]
+                    if inside(p) and inside(q):
+                        best = max(best, g(*p) + g(*q))
+                checked += 1
+                gap = g(*x) + g(*y) - best
+                if gap > tol:
+                    violations += 1
+                    worst = max(worst, gap)
+    if violations:
+        pct = 100 * violations / checked
+        print(
+            f"  {name:46s} VIOLATED {violations}/{checked} ({pct:.0f}%), "
+            f"worst gap {worst:+.4f}"
+        )
+    else:
+        print(f"  {name:46s} satisfies it ({checked} pairs checked)")
+    return violations == 0
+
+
+def discrete_convexity_of_factors():
+    """The factors at issue are not M-natural-concave -- and neither is the one
+    case whose (max, +) closure is provable, so the condition is sufficient for
+    that closure but not necessary."""
+    from scipy.special import gammaln
+
+    print("  positive controls:")
+    m_natural_concave(
+        "separable concave, -log a! - log b!",
+        lambda a, b: -gammaln(a + 1) - gammaln(b + 1),
+    )
+    m_natural_concave("linear, 2a - 3b", lambda a, b: 2.0 * a - 3.0 * b)
+    m_natural_concave(
+        "concave in the sum, -(a+b)^2/10", lambda a, b: -((a + b) ** 2) / 10.0
+    )
+
+    print("\n  the case whose (max, +) closure is provable:")
+    m_natural_concave(
+        "convolution phi(a-b), phi concave",
+        lambda a, b: (a - b) * np.log(4.0) - 4.0 - gammaln(a - b + 1),
+        domain=lambda a, b: a >= b,
+    )
+
+    print("\n  Poisson child, natural parameter eta = alpha*b + beta:")
+    for alpha, beta in [(-0.30, 3.0), (-0.08, 2.0), (-0.02, 1.0), (0.05, 0.5)]:
+        m_natural_concave(
+            f"alpha={alpha:+.2f}, beta={beta:+.1f}",
+            lambda a, b, A=alpha, B=beta: (
+                a * (A * b + B) - np.exp(A * b + B) - gammaln(a + 1)
+            ),
+        )
+
+
 if __name__ == "__main__":
     print("\n1. DAG-factorized models: the setting of equation (1)")
     print(f"   (damping {DAMPING}, tol {TOL:.0e}, random normalized conditionals)\n")
@@ -502,4 +599,8 @@ if __name__ == "__main__":
 
     print("\n5. Log-concavity is not closed under max-marginalization\n")
     log_concavity_under_max_marginalization()
+
+    print("\n6. The factors are not M-natural-concave, and neither is the")
+    print("   convolution case whose closure is provable\n")
+    discrete_convexity_of_factors()
     print()
