@@ -49,6 +49,7 @@ dev = [
     "jaxns>=2.6.3,<=2.6.9",
     "matplotlib",
     "optax>=0.0.6",
+    "optimistix>=0.1.0",
     "pandas>=3.0.3",
     "pre-commit>=4.6.1",
     "pylab-sdk",                         # jaxns dependency
@@ -234,6 +235,7 @@ unresolved-import = "ignore"
 include = [
     "numpyro/contrib/control_flow",
     "numpyro/contrib/funsor",
+    "numpyro/contrib/fwl",
     "numpyro/contrib/hsgp",
     "numpyro/contrib/stochastic_support",
     "numpyro/diagnostics.py",
