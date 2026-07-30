@@ -325,3 +325,72 @@ hsgp_rational_quadratic
 hsgp_periodic_non_centered
 --------------------------
 .. autofunction:: numpyro.contrib.hsgp.approximation.hsgp_periodic_non_centered
+
+
+Find, Weigh, Learn
+~~~~~~~~~~~~~~~~~~
+``numpyro.contrib.fwl`` implements the fast MAP-estimation procedure of *Find, Weigh, Learn:
+Fast MAP Estimation in Graphical Models*. Given a model, it locates ``K`` modes of the
+unnormalized joint density, wraps a mixture-of-Gaussians importance-sampling proposal around
+them, and returns that proposal as a NumPyro guide together with differentiable lower bounds on
+:math:`\log Z(\theta)`:
+
+* **Find** eliminates the enumerable discrete latent sites exactly by max-product (min-sum in
+  surprisal space) message passing, reusing funsor's variable elimination and adjoint pass, and
+  the continuous latent sites by `optimistix <https://docs.kidger.site/optimistix/>`_. Since
+  each half-step needs the other's variables held fixed, the two alternate as a
+  block-coordinate descent until the discrete configuration stops changing. The continuous
+  half-step is either one solve over the whole latent vector (``elimination="joint"``) or
+  clique-wise nested elimination over the junction tree (``elimination="nested"``), whose
+  message derivatives come from the envelope theorem rather than from differentiating the
+  inner solves.
+* **Weigh** gives each mode a Gaussian whose covariance is the damped local empirical Fisher
+  :math:`(\hat F(z^*_k) + \lambda I)^{-1}`, summed over the model's factors. Because each
+  factor's gradient is supported on that factor's scope, :math:`\hat F` already carries the
+  moral graph's sparsity, so ``covariance="graph"`` can build each component's precision as a
+  sum of clique-supported blocks -- with ``"diagonal"`` and ``"full"`` as the two extremes.
+* **Learn** exposes the log importance weights under that proposal, and the ELBO and IWAE
+  bounds built from them, as functions of the model and proposal parameters that ``jax.grad``
+  differentiates directly.
+
+Requires ``optimistix``, and ``funsor`` for models with discrete latent sites.
+
+.. autofunction:: numpyro.contrib.fwl.find_weigh_learn
+
+FWLResult
+---------
+.. autoclass:: numpyro.contrib.fwl.FWLResult
+    :members:
+    :member-order: bysource
+
+FWLOptions
+----------
+.. autoclass:: numpyro.contrib.fwl.FWLOptions
+    :members:
+    :member-order: bysource
+
+ModelStructure
+--------------
+.. autoclass:: numpyro.contrib.fwl.ModelStructure
+    :members:
+    :member-order: bysource
+
+LatentPacking
+-------------
+.. autoclass:: numpyro.contrib.fwl.LatentPacking
+    :members:
+    :member-order: bysource
+
+analyze
+-------
+.. autofunction:: numpyro.contrib.fwl.analyze
+
+CliqueTree
+----------
+.. autoclass:: numpyro.contrib.fwl.CliqueTree
+    :members:
+    :member-order: bysource
+
+build_clique_tree
+-----------------
+.. autofunction:: numpyro.contrib.fwl.build_clique_tree
