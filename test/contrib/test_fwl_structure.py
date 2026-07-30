@@ -134,3 +134,55 @@ def test_option_validation():
 def test_nested_requires_the_joint_objective():
     with pytest.raises(ValueError, match="does not factorize over cliques"):
         FWLOptions(elimination="nested", continuous_objective="marginal")
+
+
+def test_clique_tree_structures():
+    from numpyro.contrib.fwl.junction import build_clique_tree
+
+    def star(y):
+        hub = numpyro.sample("hub", dist.Normal(0.0, 1.0))
+        for i in range(4):
+            numpyro.sample(f"leaf{i}", dist.Normal(hub, 1.0))
+        numpyro.sample("y", dist.Normal(hub, 1.0), obs=y)
+
+    def collider(y):
+        a = numpyro.sample("a", dist.Normal(0.0, 1.0))
+        b = numpyro.sample("b", dist.Normal(0.0, 1.0))
+        c = numpyro.sample("c", dist.Normal(a + b, 1.0))
+        numpyro.sample("y", dist.Normal(c, 1.0), obs=y)
+
+    chain_tree = build_clique_tree(analyze(gaussian_chain, random.PRNGKey(0), (1.0,)))
+    assert set(chain_tree.cliques) == {
+        frozenset({"z0", "z1"}),
+        frozenset({"z1", "z2"}),
+        frozenset({"z2", "z3"}),
+    }
+    # rooting at the center keeps a 3-clique path at height 1, not 2
+    assert chain_tree.height == 1
+
+    star_tree = build_clique_tree(analyze(star, random.PRNGKey(0), (1.0,)))
+    assert len(star_tree.cliques) == 4
+    assert all(len(clique) == 2 for clique in star_tree.cliques)
+    # every clique shares the hub, so a bushy tree exists and must be found
+    assert star_tree.height == 1
+
+    # moralization joins the two parents of a collider into one clique
+    collider_tree = build_clique_tree(analyze(collider, random.PRNGKey(0), (1.0,)))
+    assert collider_tree.cliques == (frozenset({"a", "b", "c"}),)
+    assert collider_tree.height == 0
+
+
+def test_factor_assignment_is_a_partition():
+    from numpyro.contrib.fwl.junction import build_clique_tree, factor_scopes
+
+    structure = analyze(mixed_chain, random.PRNGKey(0), (jnp.zeros(6),))
+    tree = build_clique_tree(structure)
+    scopes = factor_scopes(structure)
+    assigned = [name for names in tree.factors for name in names]
+    # every factor lands in exactly one clique, so clique energies sum to the total
+    assert sorted(assigned) == sorted(scopes)
+    assert len(assigned) == len(set(assigned))
+    # and each is assigned to a clique that contains its whole scope
+    for clique, names in enumerate(tree.factors):
+        for name in names:
+            assert scopes[name] <= tree.cliques[clique] or not scopes[name]

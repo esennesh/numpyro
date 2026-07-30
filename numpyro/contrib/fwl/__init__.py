@@ -14,12 +14,15 @@ Requires :mod:`optimistix` for the continuous inner optimization, and
 :mod:`funsor` when the model has discrete latent sites.
 """
 
+from numpyro.contrib.fwl.junction import CliqueTree, build_clique_tree
 from numpyro.contrib.fwl.options import FWLOptions
 from numpyro.contrib.fwl.structure import LatentPacking, ModelStructure, analyze
 
 __all__ = [
+    "CliqueTree",
     "FWLOptions",
     "LatentPacking",
     "ModelStructure",
     "analyze",
+    "build_clique_tree",
 ]
