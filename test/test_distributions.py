@@ -2650,6 +2650,38 @@ def test_beta_proportion_invalid_mean():
         (constraints.boolean, np.array([1, 1]), np.array([True, True])),
         (constraints.boolean, np.array([-1, 1]), np.array([False, True])),
         (
+            constraints.cat(
+                [constraints.interval(-1, 1), constraints.positive],
+                dim=-1,
+                lengths=[2, 1],
+            ),
+            np.array([[0.0, 2.0, 1.0], [-2.0, 0.5, -1.0]]),
+            np.array([[True, False, True], [False, True, False]]),
+        ),
+        (
+            constraints.cat([constraints.positive, constraints.unit_interval]),
+            np.array([[1.0, 0.0, -1.0], [0.0, 0.5, 2.0]]),
+            np.array([[True, False, False], [True, True, False]]),
+        ),
+        (
+            constraints.cat(
+                [constraints.less_than(0), constraints.nonnegative],
+                dim=1,
+                lengths=[1, 2],
+            ),
+            np.array([[-1.0, 0.0, 2.0], [1.0, -1.0, 0.0]]),
+            np.array([[True, True, True], [False, False, True]]),
+        ),
+        (
+            constraints.cat(
+                [constraints.positive, constraints.unit_interval],
+                dim=-1,
+                lengths=[0, 2],
+            ),
+            np.array([[0.0, 0.5], [-1.0, 2.0]]),
+            np.array([[True, True], [False, False]]),
+        ),
+        (
             constraints.corr_cholesky,
             np.array([[[1, 0], [0, 1]], [[1, 0.1], [0, 1]]]),
             np.array([True, False]),
@@ -2781,6 +2813,30 @@ def test_constraints(constraint, x, expected):
         pass
     else:
         assert_allclose(inverse, jnp.zeros_like(inverse), atol=2e-7)
+
+
+def test_cat_constraint_pytree_and_validation():
+    constraint = constraints.cat(
+        [constraints.interval(-1.0, 1.0), constraints.positive],
+        dim=-1,
+        lengths=[2, 1],
+    )
+    value = jnp.array([[0.0, 2.0, 1.0], [-2.0, 0.5, -1.0]])
+    expected = jnp.array([[True, False, True], [False, True, False]])
+
+    assert_array_equal(jax.jit(lambda c, x: c(x))(constraint, value), expected)
+    leaves, treedef = jax.tree.flatten(constraint)
+    assert constraint.eq(jax.tree.unflatten(treedef, leaves), static=True)
+
+    with pytest.raises(ValueError, match="must equal the sum of lengths 3"):
+        constraint(jnp.ones(2))
+
+    with pytest.raises(AssertionError, match="cseq cannot be empty"):
+        constraints.cat([])
+    with pytest.raises(AssertionError, match="dim must be an integer"):
+        constraints.cat([constraints.real], dim=0.5)
+    with pytest.raises(AssertionError, match="nonnegative integers"):
+        constraints.cat([constraints.real], lengths=[-1])
 
 
 @pytest.mark.parametrize(
