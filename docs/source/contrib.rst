@@ -338,16 +338,27 @@ by a smooth inverse-CDF reparameterisation controlled by a temperature
 original one, and [1] (Theorem 5.6) gives an :math:`\eta`-schedule under which the
 DSGD gradient estimator converges almost surely to stationary points.
 
-Unbounded families (Poisson, Geometric, GammaPoisson / NegativeBinomial, and
-their zero-inflated wrappers) are smoothed in *value space*: the CDF is convolved
-with a logistic kernel, :math:`Q_{\eta}(z) = \sum_k q(k)\,\sigma_{\eta}(z-k)`, which is
-the CDF of :math:`\sum_k q(k)\,\mathrm{Logistic}(k, \eta)`. Because the terms are
-weighted by the pmf, this needs no support truncation: evaluation uses only a
-small window of integers around :math:`z` plus the closed-form bulk CDF, the
-Lipschitz constant is bounded by :math:`\frac{1}{4\eta}` independent of the support
-size, and sampling inverts :math:`Q_{\eta}` by bracketed bisection with an
-implicit-function-theorem gradient. Finite-support families use the grid
-inverse-CDF :class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform`.
+Finite-support families use the grid inverse-CDF
+:class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform`. Unbounded families
+(Poisson, Geometric, GammaPoisson / NegativeBinomial, and their zero-inflated
+wrappers) instead use the adaptive index-space relaxed count
+:func:`~numpyro.contrib.diag_sgd.adaptive_relaxed_count`. Writing
+:math:`a_k = \sigma_\eta(u - F(k))` and
+:math:`w_k = a_{k-1} - a_k`, it returns the convex combination
+
+.. math::
+
+    Q_\eta(u) = \frac{\sum_{k=0}^{\infty} k w_k}
+                         {\sum_{k=0}^{\infty} w_k}.
+
+The implementation accumulates the CDF from the analytically continued log-pmf
+and discovers a finite numerical horizon at runtime, stopping after the pmf has
+passed its mode and decayed below a relative tolerance. Because this requires a
+:func:`jax.lax.while_loop`, distribution-parameter gradients use forward-mode
+automatic differentiation through a custom reverse-mode rule. The corresponding
+:class:`~numpyro.contrib.diag_sgd.SmoothedCount` evaluates the analytically
+continued discrete log-pmf at the relaxed count instead of using a
+change-of-variables density.
 
 Typical usage anneals :math:`\\eta` over training::
 
@@ -383,9 +394,9 @@ SmoothedDiscrete
 ----------------
 .. autofunction:: numpyro.contrib.diag_sgd.SmoothedDiscrete
 
-WindowedSmoothICDFTransform
----------------------------
-.. autoclass:: numpyro.contrib.diag_sgd.WindowedSmoothICDFTransform
+SmoothedCount
+-------------
+.. autoclass:: numpyro.contrib.diag_sgd.SmoothedCount
     :members:
     :show-inheritance:
     :member-order: bysource
@@ -415,3 +426,7 @@ smooth_switch
 smooth_icdf
 -----------
 .. autofunction:: numpyro.contrib.diag_sgd.smooth_icdf
+
+adaptive_relaxed_count
+----------------------
+.. autofunction:: numpyro.contrib.diag_sgd.adaptive_relaxed_count
