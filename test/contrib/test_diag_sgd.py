@@ -527,6 +527,18 @@ def test_geometric_latent_model():
     assert isinstance(k_fn, SmoothedCount)
 
 
+def test_gamma_count_latent_model():
+    def model(obs):
+        k = numpyro.sample("k", dist.GammaCount(2.0, 5.0))
+        numpyro.sample("obs", dist.Normal(k.astype(float), 1.0), obs=obs)
+
+    smoothed = dsgd(model)
+    with handlers.seed(rng_seed=8):
+        trace = handlers.trace(lambda eta: smoothed(eta, jnp.array(4.0))).get_trace(ETA)
+    k_fn = trace["k"]["fn"]
+    assert isinstance(k_fn, SmoothedCount)
+
+
 def test_poisson_latent_model():
     def model(obs):
         k = numpyro.sample("k", dist.Poisson(jnp.array(5.0)))
@@ -580,6 +592,7 @@ _UNBOUNDED_CASES = [
     ("poisson_high", lambda: dist.Poisson(jnp.array(90.0)), 700),
     ("geometric", lambda: dist.GeometricProbs(jnp.array(0.5)), 200),
     ("geometric_logits", lambda: dist.GeometricLogits(jnp.array(0.3)), 200),
+    ("gamma_count", lambda: dist.GammaCount(1.5, 4.0), 200),
     ("negbin", lambda: dist.NegativeBinomialProbs(5, jnp.array(0.4)), 300),
     ("gammapoisson", lambda: dist.GammaPoisson(jnp.array(5.0), jnp.array(1.5)), 300),
     ("zip", lambda: dist.ZeroInflatedPoisson(jnp.array(0.3), jnp.array(4.0)), 200),
@@ -653,6 +666,27 @@ class TestAnchoredTransform:
         with pytest.raises(ValueError, match="anchor must be one of"):
             SmoothedDiscrete(d, ETA, anchor="normal")
 
+    @pytest.mark.parametrize("anchor", ["binary", "cornish-fisher"])
+    def test_gamma_count_parameter_gradients_are_finite(self, anchor):
+        parameters = jnp.log(jnp.array([1.5, 4.0]))
+        u = jnp.linspace(0.05, 0.95, 17)
+
+        def total(log_parameters):
+            concentration, rate = jnp.exp(log_parameters)
+            distribution = dist.GammaCount(concentration, rate)
+            return anchored_relaxed_count(
+                distribution,
+                u,
+                ETA,
+                anchor=anchor,
+                max_count=100,
+                width=16,
+            ).sum()
+
+        value, gradient = value_and_grad(total)(parameters)
+        assert jnp.isfinite(value)
+        assert jnp.all(jnp.isfinite(gradient))
+
     def test_dsgd_threads_anchor_to_count_sites(self):
         def model():
             numpyro.sample("z", dist.Poisson(jnp.array(4.0)))
@@ -670,6 +704,7 @@ class TestSmoothedDiscreteRouting:
         for d in (
             dist.Poisson(jnp.array(4.0)),
             dist.GeometricProbs(jnp.array(0.4)),
+            dist.GammaCount(1.5, 4.0),
             dist.NegativeBinomialProbs(total_count=3, probs=jnp.array(0.5)),
             dist.ZeroInflatedPoisson(jnp.array(0.3), jnp.array(4.0)),
         ):
@@ -775,6 +810,19 @@ class TestToEventSmoothing:
 
 
 class TestAdaptiveSampling:
+    def test_gamma_count_log_prob_is_analytic_continuation(self):
+        distribution = dist.GammaCount(1.5, 4.0)
+        smoothed = SmoothedDiscrete(distribution, 0.2)
+        integer_values = jnp.arange(7)
+        relaxed_values = jnp.array([0.2, 1.5, 3.7])
+
+        assert_allclose(
+            smoothed.log_prob(integer_values),
+            distribution.log_prob(integer_values),
+            atol=1e-5,
+        )
+        assert jnp.all(jnp.isfinite(smoothed.log_prob(relaxed_values)))
+
     @pytest.mark.parametrize(
         "make",
         [
@@ -1141,3 +1189,35 @@ def test_count_anchor_saturates_worst_case_draw():
 def test_count_anchor_saturates_rejects_nonpositive_bound():
     with pytest.raises(ValueError, match="max_count must be positive"):
         count_anchor_saturates(dist.Poisson(jnp.asarray(1.0)), jnp.asarray([0.5]), 0)
+
+
+def test_count_sf_gamma_count_matches_one_minus_cdf():
+    base_dist = dist.GammaCount(jnp.asarray(2.0), jnp.asarray(3.0))
+    counts = jnp.arange(10.0)
+    assert_allclose(
+        _count_sf(base_dist, counts), 1.0 - _count_cdf(base_dist, counts), atol=1e-5
+    )
+
+
+def test_anchored_relaxed_count_gamma_count_gradient_survives_saturation():
+    # Concentration 1 is the Poisson special case, so the CDF at k = 0 rounds
+    # to exactly 1.0 below rate ~1e-7 and the relaxation used to lose half its
+    # gradient there.  The survival function is still 1e-8 at that point.
+    uniforms = jax.random.uniform(jax.random.key(0), (4096,))
+
+    def normalised(rate):
+        def mean_relaxed_count(log_rate):
+            base_dist = dist.GammaCount(jnp.asarray(1.0), jnp.exp(log_rate))
+            return jnp.mean(
+                anchored_relaxed_count(base_dist, uniforms, 0.1, width=8, max_count=256)
+            )
+
+        return float(grad(mean_relaxed_count)(jnp.log(jnp.asarray(rate)))) / rate
+
+    saturated = dist.GammaCount(jnp.asarray(1.0), jnp.asarray(1e-8))
+    assert _count_cdf(saturated, jnp.asarray(0.0)) == 1.0
+    assert _count_sf(saturated, jnp.asarray(0.0)) > 0.0
+
+    unsaturated = normalised(1e-6)
+    for rate in (1e-8, 1e-10):
+        assert_allclose(normalised(rate), unsaturated, rtol=1e-3)

@@ -57,6 +57,7 @@ from numpyro.distributions.discrete import (
     CategoricalLogits,
     CategoricalProbs,
     DiscreteUniform,
+    GammaCount,
     GeometricLogits,
     GeometricProbs,
     Poisson,
@@ -172,7 +173,7 @@ def _compute_cdf_grid(d, M: int):
 
     if isinstance(d, (BernoulliProbs, BernoulliLogits)):
         # K = 2; one boundary F(0) = 1 − p
-        return (1.0 - d.probs)[..., None]  # (*B, 1)
+        return (1.0 - jnp.asarray(d.probs))[..., None]  # (*B, 1)
 
     if isinstance(d, (CategoricalProbs, CategoricalLogits)):
         # F(k) = cumsum(probs)[k] for k = 0 … K−2
@@ -190,10 +191,11 @@ def _compute_cdf_grid(d, M: int):
         # Expand for batch; ks broadcasts as (M−1,)
         return (ks + 1.0) / n[..., None]  # (*B, M−1)
 
-    # Unbounded families (Poisson, Geometric, GammaPoisson / NegativeBinomial,
-    # ZeroInflated) are intentionally not handled here: the truncated grid has an
-    # O(M) saturated-tail bias for unbounded support. They use the grid-free
-    # anchored index-space relaxed count (anchored_relaxed_count) instead.
+    # Unbounded families (Poisson, Geometric, GammaCount, GammaPoisson /
+    # NegativeBinomial, ZeroInflated) are intentionally not handled here: the
+    # truncated grid has an O(M) saturated-tail bias for unbounded support. They
+    # use the grid-free anchored index-space relaxed count
+    # (anchored_relaxed_count) instead.
     raise ValueError(
         f"numpyro.contrib.diag_sgd: the grid inverse-CDF supports only "
         f"finite-support families; {type(d).__name__} is unbounded — it uses the "
@@ -367,11 +369,11 @@ class _IdxSpec:
 
 def _idx_spec(d) -> Optional["_IdxSpec"]:
     """Return an :class:`_IdxSpec` for supported unbounded families (Poisson,
-    Geometric, GammaPoisson / NegativeBinomial and their zero-inflated
-    wrappers), else ``None``.  ``log_pmf(k, params)`` is the analytic
-    continuation of the discrete log-pmf (valid for real ``k >= 0``): it is
-    consumed with integer ``k`` inside the accumulation and with the continuous
-    relaxed count as the :class:`SmoothedCount` density term."""
+    Geometric, GammaCount, GammaPoisson / NegativeBinomial and their
+    zero-inflated wrappers), else ``None``. ``log_pmf(k, params)`` is the
+    analytic continuation of the discrete log-pmf (valid for real ``k >= 0``):
+    it is consumed with integer ``k`` inside the accumulation and with the
+    continuous relaxed count as the :class:`SmoothedCount` density term."""
     ftype = jnp.result_type(float)
 
     if isinstance(d, Poisson):
@@ -387,6 +389,17 @@ def _idx_spec(d) -> Optional["_IdxSpec"]:
 
         def log_pmf(k, p):
             return _unvalidated_log_prob(GeometricProbs(p["probs"]), k)
+
+        return _IdxSpec(log_pmf, params)
+
+    if isinstance(d, GammaCount):
+        params = {
+            "concentration": jnp.asarray(d.concentration, dtype=ftype),
+            "rate": jnp.asarray(d.rate, dtype=ftype),
+        }
+
+        def log_pmf(k, p):
+            return _unvalidated_log_prob(GammaCount(p["concentration"], p["rate"]), k)
 
         return _IdxSpec(log_pmf, params)
 
@@ -526,6 +539,12 @@ def _count_cdf(base_dist, value):
     elif isinstance(base_dist, (GeometricProbs, GeometricLogits)):
         probs = _expand_count_parameter(base_dist.probs, value, base_dist.batch_shape)
         cdf = -jnp.expm1((value + 1.0) * jnp.log1p(-probs))
+    elif isinstance(base_dist, GammaCount):
+        concentration = _expand_count_parameter(
+            base_dist.concentration, value, base_dist.batch_shape
+        )
+        rate = _expand_count_parameter(base_dist.rate, value, base_dist.batch_shape)
+        cdf = gammaincc(concentration * (value + 1.0), concentration * rate)
     elif isinstance(base_dist, GammaPoisson):
         concentration = _expand_count_parameter(
             base_dist.concentration, value, base_dist.batch_shape
@@ -596,6 +615,14 @@ def _count_sf(base_dist, value):
     elif isinstance(base_dist, (GeometricProbs, GeometricLogits)):
         probs = _expand_count_parameter(base_dist.probs, value, base_dist.batch_shape)
         sf = jnp.exp((value + 1.0) * jnp.log1p(-probs))
+    elif isinstance(base_dist, GammaCount):
+        concentration = _expand_count_parameter(
+            base_dist.concentration, value, base_dist.batch_shape
+        )
+        rate = _expand_count_parameter(base_dist.rate, value, base_dist.batch_shape)
+        # GammaCount.cdf is the upper regularised tail, so the survival
+        # function is the lower one at the same arguments -- no subtraction.
+        sf = gammainc(concentration * (value + 1.0), concentration * rate)
     elif isinstance(base_dist, GammaPoisson):
         concentration = _expand_count_parameter(
             base_dist.concentration, value, base_dist.batch_shape
@@ -647,6 +674,13 @@ def _pmf_ratio_down(base_dist, value):
         return value / expand(base_dist.rate)
     if isinstance(base_dist, (GeometricProbs, GeometricLogits)):
         return jnp.ones_like(value) / (1.0 - expand(base_dist.probs))
+    if isinstance(base_dist, GammaCount):
+        previous_log_pmf = _count_log_pmf(base_dist, value - 1.0, trailing_ndims=1)
+        current_log_pmf = _count_log_pmf(base_dist, value, trailing_ndims=1)
+        # ``GammaCount.log_prob`` floors an underflowed tail rather than
+        # returning ``-inf``, so this difference is finite everywhere and needs
+        # no ``isnan`` guard of its own.
+        return jnp.exp(previous_log_pmf - current_log_pmf)
     if isinstance(base_dist, GammaPoisson):
         concentration = expand(base_dist.concentration)
         rate = expand(base_dist.rate)
@@ -672,6 +706,23 @@ def _count_skewness(base_dist):
         return 1.0 / jnp.sqrt(base_dist.rate)
     if isinstance(base_dist, (GeometricProbs, GeometricLogits)):
         return (2.0 - base_dist.probs) / jnp.sqrt(1.0 - base_dist.probs)
+    if isinstance(base_dist, GammaCount):
+        counts = jnp.arange(1, base_dist.max_terms + 1).reshape(
+            (-1,) + (1,) * len(base_dist.batch_shape)
+        )
+        tail_probabilities = gammainc(
+            base_dist.concentration * counts,
+            base_dist.concentration * base_dist.rate,
+        )
+        mean = jnp.sum(tail_probabilities, axis=0)
+        second_moment = jnp.sum((2.0 * counts - 1.0) * tail_probabilities, axis=0)
+        third_moment = jnp.sum(
+            (3.0 * counts**2 - 3.0 * counts + 1.0) * tail_probabilities,
+            axis=0,
+        )
+        third_central = third_moment - 3.0 * mean * second_moment + 2.0 * mean**3
+        variance = jnp.maximum(second_moment - mean**2, 0.0)
+        return jnp.where(variance > 0.0, third_central / variance**1.5, 0.0)
     if isinstance(base_dist, GammaPoisson):
         return (base_dist.rate + 2.0) / jnp.sqrt(
             base_dist.concentration * (base_dist.rate + 1.0)
@@ -761,8 +812,8 @@ def anchored_relaxed_count(
     This avoids the cross-lane straggler cost of the runtime-adaptive sampler.
     ``anchor="binary"`` uses a fixed-depth CDF search and is the robust default;
     ``anchor="cornish-fisher"`` uses a cheaper moment approximation.  Both
-    choices work across Poisson, Geometric, GammaPoisson / NegativeBinomial,
-    and their zero-inflated wrappers.
+    choices work across Poisson, Geometric, GammaCount, GammaPoisson /
+    NegativeBinomial, and their zero-inflated wrappers.
 
     :param base_dist: supported unbounded discrete distribution.
     :param u: uniform variate(s) in ``(0, 1)``.
@@ -984,8 +1035,8 @@ def adaptive_relaxed_count(
     inverted and its ``log|dz/du|`` is never needed.
 
     :param base_dist: an unbounded discrete Distribution supported by
-        :func:`_idx_spec` (Poisson, Geometric, GammaPoisson / NegativeBinomial,
-        or a zero-inflated wrapper).
+        :func:`_idx_spec` (Poisson, Geometric, GammaCount, GammaPoisson /
+        NegativeBinomial, or a zero-inflated wrapper).
     :param u: uniform variate(s) in (0, 1); the return has the same shape.
     :param float eta: smoothing temperature :math:`\eta > 0`.
     :param float tol: relative pmf-decay stopping threshold.
@@ -1014,10 +1065,10 @@ class SmoothedCount(dist.Distribution):
     discontinuous quantile :math:`Q_D` with the fixed-window anchored
     index-space relaxed count :math:`Q_\eta`
     (:func:`anchored_relaxed_count`): a low-variance reparameterised sample
-    approximating the full mean-unbiased identity.  The *density* contribution to the
-    objective is the **analytic continuation of the discrete log-pmf**
-    (``k! -> Gamma(z+1)``) evaluated at the continuous relaxed count -- for
-    Poisson,
+    approximating the full mean-unbiased identity. The *density* contribution
+    to the objective is the **analytic continuation of the discrete log-pmf**
+    through gamma functions (for example, ``k! -> Gamma(z+1)``) evaluated at
+    the continuous relaxed count -- for Poisson,
 
         :math:`\log \tilde p(z) = z\,\log\lambda - \lambda - \log\Gamma(z+1)`
 
@@ -1028,22 +1079,24 @@ class SmoothedCount(dist.Distribution):
     Why not the pushforward density: it is unbounded above as the transform
     flattens (:math:`dz/du \to 0` for a near-deterministic, low-rate
     distribution), so the smoothed ELBO's :math:`\log p - \log q` term is not a
-    valid :math:`-\mathrm{KL}` and diverges.  The analytic-continuation log-pmf
-    is bounded, and because the exponential-family count log-pmf is affine in
-    ``z`` its :math:`\log p - \log q` term is a genuine :math:`-\mathrm{KL}`
-    surrogate -- exact whenever :math:`\mathbb{E}[z] = \mathrm{mean}`, which the
-    mean-unbiased relaxed count satisfies.  As :math:`\eta \to 0` the relaxed
+    valid :math:`-\mathrm{KL}` and diverges. The analytic-continuation log-pmf
+    is bounded. For exponential-family count laws whose log-pmf is affine in
+    ``z``, its :math:`\log p - \log q` term is a genuine
+    :math:`-\mathrm{KL}` surrogate, exact whenever
+    :math:`\mathbb{E}[z] = \mathrm{mean}`, which the mean-unbiased relaxed count
+    satisfies. GammaCount's continuation is nonlinear in ``z`` and therefore
+    has finite-temperature smoothing bias. As :math:`\eta \to 0`, every relaxed
     count converges to the integer quantile and :math:`\log\tilde p` to the
     exact log-pmf, so the smoothed objective converges to the true discrete one
-    (Theorem 5.6), with O(:math:`\eta`) bias entering only through terms
-    nonlinear in ``z`` (e.g. the likelihood).
+    (Theorem 5.6); nonlinear terms contribute O(:math:`\eta`) bias.
 
     ``z`` is continuous, so the site support is continuous and ``log_prob``
-    needs no transform inversion -- it is a closed-form ``gammaln`` expression.
+    needs no transform inversion; it is evaluated directly with gamma and
+    incomplete-gamma functions.
 
     :param base_dist: an unbounded discrete Distribution supported by
-        :func:`_idx_spec` (Poisson, Geometric, GammaPoisson / NegativeBinomial,
-        or a zero-inflated wrapper).
+        :func:`_idx_spec` (Poisson, Geometric, GammaCount, GammaPoisson /
+        NegativeBinomial, or a zero-inflated wrapper).
     :param float eta: smoothing temperature :math:`\eta > 0`.
     :param str anchor: count anchor method, ``"binary"`` (default) or
         ``"cornish-fisher"``.
@@ -1171,7 +1224,7 @@ def SmoothedDiscrete(
       onto the fixed codomain ``[0, K-1]`` shared by every distribution of the
       family, so its pushforward density is proper and ``log p - log q`` is a
       valid ``-KL``.
-    * **Unbounded families** (Poisson, Geometric, GammaPoisson /
+    * **Unbounded families** (Poisson, Geometric, GammaCount, GammaPoisson /
       NegativeBinomial and their zero-inflated wrappers) become a
       :class:`SmoothedCount`: the anchored index-space relaxed count as the
       reparameterised sample, with the analytic-continuation log-pmf as the
