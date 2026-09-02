@@ -255,11 +255,11 @@ Other kernels can be used similarly.
 
     2. Riutort-Mayol, G., Bürkner, PC., Andersen, M.R. et al. Practical Hilbert space
        approximate Bayesian Gaussian processes for probabilistic programming. Stat Comput 33, 17 (2023).
-    
+
     3. `Orduz, J., A Conceptual and Practical Introduction to Hilbert Space GPs Approximation Methods <https://juanitorduz.github.io/hsgp_intro>`_.
-    
+
     4. `Example: Hilbert space approximation for Gaussian processes <https://num.pyro.ai/en/stable/examples/hsgp.html>`_.
-    
+
     5. `Gelman, Vehtari, Simpson, et al., Bayesian workflow book - Birthdays <https://avehtari.github.io/casestudies/Birthdays/birthdays.html>`_.
 
 .. note::
@@ -338,10 +338,13 @@ by a smooth inverse-CDF reparameterisation controlled by a temperature
 original one, and [1] (Theorem 5.6) gives an :math:`\eta`-schedule under which the
 DSGD gradient estimator converges almost surely to stationary points.
 
-Every discrete site is relaxed in *index space*. Writing
-:math:`a_k = \sigma_\eta(u - F(k))` for the CDF :math:`F` and soft one-hot
-weights :math:`w_k = a_{k-1} - a_k`, the relaxed sample is the convex
-combination of the support points
+Finite-support families use the grid inverse-CDF
+:class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform`. Unbounded families
+(Poisson, Geometric, GammaCount, GammaPoisson / NegativeBinomial, and their
+zero-inflated wrappers) instead use the adaptive index-space relaxed count
+:func:`~numpyro.contrib.diag_sgd.adaptive_relaxed_count`. Writing
+:math:`a_k = \sigma_\eta(u - F(k))` and
+:math:`w_k = a_{k-1} - a_k`, it returns the convex combination
 
 .. math::
 
