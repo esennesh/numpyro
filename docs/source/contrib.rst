@@ -1,6 +1,12 @@
 Contributed Code
 ================
 
+Self-fitting MAP proposal
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. autoclass:: numpyro.contrib.map_proposal.AutoMAPProposal
+    :members:
+
 Nested Sampling
 ~~~~~~~~~~~~~~~
 Nested Sampling is a non-MCMC approach that works for arbitrary probability models, and is particularly well suited to complex posteriors:
