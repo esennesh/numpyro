@@ -356,10 +356,13 @@ by a smooth inverse-CDF reparameterisation controlled by a temperature
 original one, and [1] (Theorem 5.6) gives an :math:`\eta`-schedule under which the
 DSGD gradient estimator converges almost surely to stationary points.
 
-Every discrete site is relaxed in *index space*. Writing
-:math:`a_k = \sigma_\eta(u - F(k))` for the CDF :math:`F` and soft one-hot
-weights :math:`w_k = a_{k-1} - a_k`, the relaxed sample is the convex
-combination of the support points
+Finite-support families use the grid inverse-CDF
+:class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform`. Unbounded families
+(Poisson, Geometric, GammaCount, GammaPoisson / NegativeBinomial, and their
+zero-inflated wrappers) instead use the adaptive index-space relaxed count
+:func:`~numpyro.contrib.diag_sgd.adaptive_relaxed_count`. Writing
+:math:`a_k = \sigma_\eta(u - F(k))` and
+:math:`w_k = a_{k-1} - a_k`, it returns the convex combination
 
 .. math::
 
