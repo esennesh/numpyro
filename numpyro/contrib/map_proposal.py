@@ -6,11 +6,11 @@
 from contextlib import ExitStack
 from functools import partial
 from itertools import product
+import math
+from typing import Any, NamedTuple
 
 from jax import lax, random
-from jax.flatten_util import ravel_pytree
 import jax.numpy as jnp
-from jax.scipy.optimize import minimize
 
 import numpyro
 from numpyro import handlers
@@ -30,8 +30,36 @@ from numpyro.infer import Predictive
 from numpyro.infer.autoguide import AutoGuide
 from numpyro.infer.initialization import init_to_uniform
 from numpyro.infer.util import helpful_support_errors, log_density
+from numpyro.optim import Adam, Minimize, _NumPyroOptim, optax_to_numpyro
 
 __all__ = ["AutoMAPProposal"]
+
+
+def _as_iterative_optimizer(optimizer):
+    if isinstance(optimizer, Minimize):
+        raise TypeError("AutoMAPProposal requires an iterative optimizer.")
+    if isinstance(optimizer, _NumPyroOptim):
+        return optimizer
+    try:
+        import optax
+    except ImportError as error:
+        raise ImportError(
+            "An iterative optimizer must be a NumPyro optimizer, or Optax must be "
+            "installed to use an optax.GradientTransformation."
+        ) from error
+    if not isinstance(optimizer, optax.GradientTransformation):
+        raise TypeError(
+            "Expected an iterative numpyro.optim._NumPyroOptim or "
+            f"optax.GradientTransformation, but got {type(optimizer)}."
+        )
+    return optax_to_numpyro(optimizer)
+
+
+class _OptimizationResult(NamedTuple):
+    converged: bool
+    losses: jnp.ndarray
+    num_steps: int
+    params: Any
 
 
 class _ShiftedCategorical(dist.Distribution):
@@ -84,14 +112,26 @@ class AutoMAPProposal(AutoGuide):
         \tilde z^* = \mathop{\rm argmax}_{\tilde z}
         \log \gamma_{\theta,\eta}(\tilde z; x),
 
-    and then fits the continuous and count proposal parameters by minimizing a
-    fixed-randomness Monte Carlo estimate of
+    and then fits the continuous and count proposal parameters with stochastic
+    gradients of
 
     .. math::
 
         \mathbb E_{q_\phi(\tilde z)}\left[
         \log q_\phi(\tilde z)
         - \log \gamma_{\theta,\eta}(\tilde z; x)\right].
+
+    Every :math:`K` optimizer steps, convergence is checked using the average
+    loss :math:`\bar{\mathcal L}_j` over that interval. Relative to the best
+    previous average :math:`b_{j-1}`, an improvement is meaningful when
+
+    .. math::
+
+        b_{j-1} - \bar{\mathcal L}_j
+        > \tau \left(1 + \lvert b_{j-1} \rvert\right).
+
+    Optimization terminates after the configured number of consecutive checks
+    without a meaningful improvement.
 
     For a continuous site with support :math:`S_i` and bijection
     :math:`T_{S_i}`, the proposal is
@@ -113,8 +153,12 @@ class AutoMAPProposal(AutoGuide):
     genuinely discrete samples for evaluation by :attr:`model`.
 
     Sites with equal support constraints reuse the same proposal family but do
-    not share parameters. The Monte Carlo randomness is held fixed during
-    optimization, making the proposal objective deterministic.
+    not share parameters. Both optimization phases use independent instances
+    of :class:`~numpyro.optim.Adam` by default and require iterative NumPyro or
+    Optax optimizers. Each proposal-optimization step draws fresh Monte Carlo
+    particles. Optimization stops when the average loss fails to improve by
+    more than the configured tolerance for the configured number of checks;
+    the maximum step counts are safety caps rather than fixed iteration counts.
 
     This experimental guide supports continuous latent variables with
     bijectable supports and the discrete families supported by
@@ -130,11 +174,23 @@ class AutoMAPProposal(AutoGuide):
     :param float init_dispersion: Initial value for every continuous-site
         dispersion.
     :param callable init_loc_fn: A per-site initialization function.
-    :param int num_dispersion_particles: Number of fixed Monte Carlo particles
-        used to optimize the proposal objective.
-    :param dict optimizer_options: Options passed to
-        :func:`jax.scipy.optimize.minimize` for both optimization stages.
+    :param int map_max_steps: Maximum number of relaxed-MAP optimization steps.
+    :param map_optimizer: Iterative NumPyro or Optax optimizer for the relaxed
+        MAP objective. Defaults to Adam with step size ``0.01``.
+    :param float map_tolerance: Relative loss-improvement tolerance for MAP.
+    :param int num_dispersion_particles: Number of Monte Carlo particles in
+        each stochastic estimate of the proposal objective.
     :param str prefix: Prefix used for internal proposal sample sites.
+    :param int proposal_max_steps: Maximum number of stochastic proposal-fitting
+        steps.
+    :param proposal_optimizer: Iterative NumPyro or Optax optimizer for the
+        proposal objective. Defaults to Adam with step size ``0.01``.
+    :param float proposal_tolerance: Relative loss-improvement tolerance for
+        proposal fitting.
+    :param int termination_check_interval: Number of optimizer steps averaged
+        for each convergence check.
+    :param int termination_patience: Number of consecutive checks without a
+        meaningful loss improvement required for convergence.
     """
 
     def __init__(
@@ -145,16 +201,35 @@ class AutoMAPProposal(AutoGuide):
         dsgd_kwargs=None,
         init_dispersion=0.1,
         init_loc_fn=init_to_uniform,
+        map_max_steps=1000,
+        map_optimizer=None,
+        map_tolerance=1e-5,
         num_dispersion_particles=32,
-        optimizer_options=None,
         prefix="auto",
+        proposal_max_steps=1000,
+        proposal_optimizer=None,
+        proposal_tolerance=1e-3,
+        termination_check_interval=50,
+        termination_patience=5,
     ):
         if discrete_temperature <= 0:
             raise ValueError("discrete_temperature must be positive.")
         if init_dispersion <= 0:
             raise ValueError("init_dispersion must be positive.")
+        if map_max_steps < 1:
+            raise ValueError("map_max_steps must be positive.")
+        if map_tolerance < 0:
+            raise ValueError("map_tolerance must be nonnegative.")
         if num_dispersion_particles < 1:
             raise ValueError("num_dispersion_particles must be positive.")
+        if proposal_max_steps < 1:
+            raise ValueError("proposal_max_steps must be positive.")
+        if proposal_tolerance < 0:
+            raise ValueError("proposal_tolerance must be nonnegative.")
+        if termination_check_interval < 1:
+            raise ValueError("termination_check_interval must be positive.")
+        if termination_patience < 1:
+            raise ValueError("termination_patience must be positive.")
 
         dsgd_kwargs = {} if dsgd_kwargs is None else dsgd_kwargs.copy()
         if "smoothed_distributions" in dsgd_kwargs:
@@ -172,14 +247,23 @@ class AutoMAPProposal(AutoGuide):
         self._finite_distributions = {}
         self._init_dispersion = init_dispersion
         self._map_locs = {}
+        self._map_max_steps = map_max_steps
+        self._map_optimizer = _as_iterative_optimizer(
+            Adam(step_size=0.01) if map_optimizer is None else map_optimizer
+        )
+        self._map_tolerance = map_tolerance
         self._num_dispersion_particles = num_dispersion_particles
-        self._optimizer_options = (
-            {} if optimizer_options is None else optimizer_options.copy()
+        self._proposal_max_steps = proposal_max_steps
+        self._proposal_optimizer = _as_iterative_optimizer(
+            Adam(step_size=0.01) if proposal_optimizer is None else proposal_optimizer
         )
         self._proposal_params = {}
+        self._proposal_tolerance = proposal_tolerance
         self._smooth_transforms = {}
         self._support_ids = {}
         self._supports = []
+        self._termination_check_interval = termination_check_interval
+        self._termination_patience = termination_patience
         self._transforms = {}
         self.dispersion_result = None
         self.map_result = None
@@ -202,28 +286,27 @@ class AutoMAPProposal(AutoGuide):
                 )
         return result
 
-    def _find_map(self, model_args, model_kwargs):
-        flat_init, unravel = ravel_pytree(self._init_locs)
-
-        def objective(flat_unconstrained):
-            unconstrained = unravel(flat_unconstrained)
+    def _find_map(self, model_args, model_kwargs, rng_key):
+        def objective(unconstrained, key):
             constrained = {
                 name: self._transforms[name](value)
                 for name, value in unconstrained.items()
             }
-            seeded_model = handlers.seed(self.relaxed_model, rng_seed=random.key(0))
+            seeded_model = handlers.seed(self.relaxed_model, rng_seed=key)
             log_target, _ = log_density(
                 seeded_model, model_args, model_kwargs, constrained
             )
             return -log_target
 
-        self.map_result = minimize(
+        self.map_result = self._optimize(
+            self._init_locs,
+            self._map_max_steps,
             objective,
-            flat_init,
-            method="BFGS",
-            options=self._optimizer_options,
+            self._map_optimizer,
+            rng_key,
+            self._map_tolerance,
         )
-        return unravel(self.map_result.x)
+        return self.map_result.params
 
     def _fit_finite_parameters(
         self, model_args, model_kwargs, proposal_keys, parameters
@@ -360,9 +443,74 @@ class AutoMAPProposal(AutoGuide):
                 }
         return parameters
 
-    def _proposal_objective(self, model_args, model_kwargs, proposal_keys, parameters):
+    def _optimize(
+        self,
+        initial_parameters,
+        max_steps,
+        objective,
+        optimizer,
+        rng_key,
+        tolerance,
+    ):
+        best_loss = math.inf
+        converged = False
+        loss_chunks = []
+        num_steps = 0
+        optimizer_state = optimizer.init(initial_parameters)
+        stalled_checks = 0
+        step_keys = random.split(rng_key, max_steps)
+
+        def step(state, key):
+            def loss_fn(parameters):
+                return objective(parameters, key), None
+
+            (loss, _), state = optimizer.eval_and_stable_update(loss_fn, state)
+            return state, loss
+
+        while num_steps < max_steps:
+            chunk_size = min(
+                self._termination_check_interval,
+                max_steps - num_steps,
+            )
+            optimizer_state, losses = lax.scan(
+                step,
+                optimizer_state,
+                step_keys[num_steps : num_steps + chunk_size],
+            )
+            loss_chunks.append(losses)
+            num_steps += chunk_size
+
+            current_loss = float(jnp.nanmean(losses))
+            loss_scale = tolerance * (1.0 + abs(best_loss))
+            if math.isfinite(current_loss) and (
+                not math.isfinite(best_loss) or current_loss < best_loss - loss_scale
+            ):
+                best_loss = current_loss
+                stalled_checks = 0
+            else:
+                stalled_checks += 1
+            if stalled_checks >= self._termination_patience:
+                converged = math.isfinite(current_loss)
+                break
+
+        return _OptimizationResult(
+            converged=converged,
+            losses=jnp.concatenate(loss_chunks),
+            num_steps=num_steps,
+            params=optimizer.get_params(optimizer_state),
+        )
+
+    def _proposal_objective(self, model_args, model_kwargs, parameters, rng_key):
         constrained = {}
         log_q = jnp.zeros(self._num_dispersion_particles)
+        model_key, proposal_key = random.split(rng_key)
+        proposal_keys = {
+            name: key
+            for name, key in zip(
+                self._map_locs,
+                random.split(proposal_key, len(self._map_locs)),
+            )
+        }
         for name in self._map_locs:
             if name in self._finite_distributions:
                 map_value = self._transforms[name](self._map_locs[name])
@@ -382,7 +530,7 @@ class AutoMAPProposal(AutoGuide):
 
         def particle_objective(particle):
             particle_values, particle_log_q = particle
-            seeded_model = handlers.seed(self.relaxed_model, rng_seed=random.key(0))
+            seeded_model = handlers.seed(self.relaxed_model, rng_seed=model_key)
             log_target, _ = log_density(
                 seeded_model, model_args, model_kwargs, particle_values
             )
@@ -464,15 +612,16 @@ class AutoMAPProposal(AutoGuide):
         if not self._event_dims:
             raise RuntimeError("AutoMAPProposal found no latent variables.")
 
-        proposal_key = numpyro.prng_key()
-        assert proposal_key is not None
+        optimizer_key = numpyro.prng_key()
+        assert optimizer_key is not None
+        finite_key, map_key, proposal_key = random.split(optimizer_key, 3)
         with handlers.block():
-            self._map_locs = self._find_map(args, kwargs)
+            self._map_locs = self._find_map(args, kwargs, map_key)
             proposal_keys = {
                 name: key
                 for name, key in zip(
                     self._map_locs,
-                    random.split(proposal_key, len(self._map_locs)),
+                    random.split(finite_key, len(self._map_locs)),
                 )
             }
             initial_parameters = self._initial_proposal_params()
@@ -482,20 +631,19 @@ class AutoMAPProposal(AutoGuide):
                 if name not in self._finite_distributions
             }
             if optimizable_parameters:
-                flat_initial_parameters, unravel = ravel_pytree(optimizable_parameters)
 
-                def objective(flat_parameters):
-                    return self._proposal_objective(
-                        args, kwargs, proposal_keys, unravel(flat_parameters)
-                    )
+                def objective(parameters, key):
+                    return self._proposal_objective(args, kwargs, parameters, key)
 
-                self.dispersion_result = minimize(
+                self.dispersion_result = self._optimize(
+                    optimizable_parameters,
+                    self._proposal_max_steps,
                     objective,
-                    flat_initial_parameters,
-                    method="BFGS",
-                    options=self._optimizer_options,
+                    self._proposal_optimizer,
+                    proposal_key,
+                    self._proposal_tolerance,
                 )
-                optimized_parameters = unravel(self.dispersion_result.x)
+                optimized_parameters = self.dispersion_result.params
             else:
                 self.dispersion_result = None
                 optimized_parameters = {}
