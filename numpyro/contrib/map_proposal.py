@@ -55,7 +55,8 @@ class _ShiftedCategorical(dist.Distribution):
 
     def enumerate_support(self, expand=True):
         values = self.base_dist.enumerate_support(expand=expand)
-        if not expand and not bool(jnp.all(self.low == self.low.reshape(-1)[0])):
+        homogeneous = bool(jnp.all(self.low == self.low.reshape(-1)[0]))
+        if not expand and not homogeneous:
             raise NotImplementedError(
                 "Inhomogeneous `low` not supported by `enumerate_support`."
             )
@@ -117,9 +118,9 @@ class AutoMAPProposal(AutoGuide):
 
     This experimental guide supports continuous latent variables with
     bijectable supports and the discrete families supported by
-    :func:`~numpyro.contrib.diag_sgd.dsgd`. It does not support data subsampling.
-    It refits on every call and should not be used inside a batched or repeatedly
-    evaluated SVI objective.
+    :func:`~numpyro.contrib.diag_sgd.dsgd`. It does not support data
+    subsampling. It refits on every call and should not be used inside a batched
+    or repeatedly evaluated SVI objective.
 
     :param callable model: A NumPyro model.
     :param float discrete_temperature: Smoothing temperature :math:`\eta` used
@@ -185,13 +186,12 @@ class AutoMAPProposal(AutoGuide):
         super().__init__(model, init_loc_fn=self._relaxed_init_loc_fn, prefix=prefix)
 
     def __call__(self, *args, **kwargs):
-        self._setup_prototype(*args, **kwargs)
+        if self.prototype_trace is None:
+            self._setup_prototype(*args, **kwargs)
 
         plates = self._create_plates(*args, **kwargs)
-        prototype_trace = self.prototype_trace
-        assert prototype_trace is not None
         result = {}
-        for name, site in prototype_trace.items():
+        for name, site in self.prototype_trace.items():
             if site["type"] != "sample" or site["is_observed"]:
                 continue
             with ExitStack() as stack:
@@ -212,10 +212,10 @@ class AutoMAPProposal(AutoGuide):
                 for name, value in unconstrained.items()
             }
             seeded_model = handlers.seed(self.relaxed_model, rng_seed=random.key(0))
-            log_gamma, _ = log_density(
+            log_target, _ = log_density(
                 seeded_model, model_args, model_kwargs, constrained
             )
-            return -log_gamma
+            return -log_target
 
         self.map_result = minimize(
             objective,
@@ -253,19 +253,20 @@ class AutoMAPProposal(AutoGuide):
                         .set(low_value + category)
                     )
 
-                    def particle_log_gamma(particle_values):
+                    def particle_log_target(particle_values):
                         seeded_model = handlers.seed(self.model, rng_seed=random.key(0))
-                        log_gamma, _ = log_density(
+                        log_target, _ = log_density(
                             seeded_model, model_args, model_kwargs, particle_values
                         )
-                        return log_gamma
+                        return log_target
 
-                    expected_log_gamma = jnp.mean(
-                        lax.map(particle_log_gamma, candidate_values)
+                    expected_log_target = jnp.mean(
+                        lax.map(particle_log_target, candidate_values)
                     )
-                    logits = logits.at[index + (category,)].set(expected_log_gamma)
+                    logits = logits.at[index + (category,)].set(expected_log_target)
             parameters[name] = {"logits": logits}
-            constrained[name] = self._get_proposal(name, parameters[name]).sample(
+            proposal = self._get_proposal(name, parameters[name])
+            constrained[name] = proposal.sample(
                 proposal_keys[name], (self._num_dispersion_particles,)
             )
         return parameters
@@ -382,10 +383,10 @@ class AutoMAPProposal(AutoGuide):
         def particle_objective(particle):
             particle_values, particle_log_q = particle
             seeded_model = handlers.seed(self.relaxed_model, rng_seed=random.key(0))
-            log_gamma, _ = log_density(
+            log_target, _ = log_density(
                 seeded_model, model_args, model_kwargs, particle_values
             )
-            return particle_log_q - log_gamma
+            return particle_log_q - log_target
 
         return jnp.mean(lax.map(particle_objective, (constrained, log_q)))
 
