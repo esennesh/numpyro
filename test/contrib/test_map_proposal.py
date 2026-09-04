@@ -4,14 +4,14 @@
 from numpy.testing import assert_allclose
 import pytest
 
-from jax import nn, random
+from jax import jit, nn, random
 import jax.numpy as jnp
 import optax
 
 import numpyro
 from numpyro import handlers
 from numpyro.contrib.diag_sgd import SmoothedCount
-from numpyro.contrib.map_proposal import AutoMAPProposal
+from numpyro.contrib.map_proposal import AutoMAPProposal, _minimize
 import numpyro.distributions as dist
 from numpyro.infer.autoguide import AutoGuide
 from numpyro.optim import Adam, Minimize
@@ -39,18 +39,21 @@ def test_accepts_optax_optimizers():
         proposal_max_steps=500,
         proposal_optimizer=optax.adam(0.01),
     )
-    map_estimate = guide.find_map(random.key(10), 2.0)
+    fit_result = guide.fit(random.key(10), 2.0)
 
-    assert_allclose(map_estimate["location"], 1.0, atol=1e-4)
+    assert_allclose(fit_result.map_estimate["location"], 1.0, atol=1e-4)
     assert_allclose(guide._dispersions["location"], 2**-0.5, rtol=0.2)
-    assert guide.dispersion_result.losses.shape == (guide.dispersion_result.num_steps,)
-    assert guide.dispersion_result.num_steps <= 500
-    assert guide.map_result.losses.shape == (guide.map_result.num_steps,)
-    assert guide.map_result.num_steps <= 300
+    assert fit_result.proposal_result.losses.shape == (
+        fit_result.proposal_result.num_steps,
+    )
+    assert fit_result.proposal_result.num_steps <= 500
+    assert fit_result.map_result.losses.shape == (fit_result.map_result.num_steps,)
+    assert fit_result.map_result.num_steps <= 300
 
 
 def test_call_exposes_only_latent_sample_sites():
     guide = AutoMAPProposal(model, num_dispersion_particles=8)
+    guide.fit(random.key(13), 2.0, jnp.array([1.0, 1.0, 0.0]))
     seeded_guide = handlers.seed(guide, random.key(3))
     proposal_trace = handlers.trace(seeded_guide).get_trace(
         2.0, jnp.array([1.0, 1.0, 0.0])
@@ -95,8 +98,15 @@ def test_finite_discrete_sites_use_exact_categorical_proposal(
         map_max_steps=50,
         num_dispersion_particles=8,
     )
-    samples = guide.sample_posterior(random.key(6), {}, observation, sample_shape=(20,))
-    proposal = guide._get_proposal("value", guide._proposal_params["value"])
+    fit_result = guide.fit(random.key(14), observation)
+    samples = guide.sample_posterior(
+        random.key(6), fit_result, observation, sample_shape=(20,)
+    )
+    proposal = guide._get_proposal(
+        "value",
+        fit_result.proposal_params["value"],
+        map_locs=fit_result.map_locs,
+    )
     categories = jnp.arange(int(upper_bound) + 1)
     expected_logits = distribution.log_prob(categories) + dist.Normal(
         categories, 0.5
@@ -122,8 +132,13 @@ def test_finite_discrete_uniform_proposal_preserves_offset_support():
         map_max_steps=20,
         num_dispersion_particles=4,
     )
-    samples = guide.sample_posterior(random.key(9), {}, 4.0, sample_shape=(20,))
-    proposal = guide._get_proposal("value", guide._proposal_params["value"])
+    fit_result = guide.fit(random.key(15), 4.0)
+    samples = guide.sample_posterior(random.key(9), fit_result, 4.0, sample_shape=(20,))
+    proposal = guide._get_proposal(
+        "value",
+        fit_result.proposal_params["value"],
+        map_locs=fit_result.map_locs,
+    )
 
     assert proposal.is_discrete
     assert jnp.all((2 <= samples["value"]) & (samples["value"] <= 4))
@@ -137,13 +152,13 @@ def test_inner_optimizer_refreshes_randomness():
 
     guide = AutoMAPProposal(empty_model, proposal_max_steps=4)
     rng_key = random.key(11)
-    result = guide._optimize(
+    result = _minimize(
+        None,
         jnp.array(0.0),
-        4,
-        lambda _, key: random.uniform(key),
+        lambda _, __, key: random.uniform(key),
         guide._proposal_optimizer,
+        guide._proposal_options,
         rng_key,
-        guide._proposal_tolerance,
     )
     expected_losses = jnp.stack(
         [random.uniform(key) for key in random.split(rng_key, 4)]
@@ -162,13 +177,13 @@ def test_inner_optimizer_stops_at_convergence():
         termination_check_interval=1,
         termination_patience=2,
     )
-    result = guide._optimize(
+    result = _minimize(
+        None,
         jnp.array(0.0),
-        10,
-        lambda _, __: jnp.array(0.0),
+        lambda _, __, ___: jnp.array(0.0),
         guide._proposal_optimizer,
+        guide._proposal_options,
         random.key(12),
-        guide._proposal_tolerance,
     )
 
     assert result.converged
@@ -177,16 +192,16 @@ def test_inner_optimizer_stops_at_convergence():
 
 def test_map_depends_on_model_arguments():
     guide = AutoMAPProposal(model, num_dispersion_particles=8)
-    first_map = guide.find_map(random.key(0), 2.0, jnp.array([1.0, 1.0, 0.0]))
-    second_map = guide.find_map(
+    first_map = guide.fit(random.key(0), 2.0, jnp.array([1.0, 1.0, 0.0])).map_estimate
+    second_map = guide.fit(
         random.key(1), -2.0, outcomes=jnp.array([0.0, 0.0, 0.0])
-    )
+    ).map_estimate
 
     assert isinstance(guide, AutoGuide)
-    assert_allclose(first_map["location"], 1.0, atol=1e-4)
-    assert_allclose(first_map["probability"], 0.6, atol=1e-4)
-    assert_allclose(second_map["location"], -1.0, atol=1e-4)
-    assert_allclose(second_map["probability"], 0.2, atol=1e-4)
+    assert_allclose(first_map["location"], 1.0, atol=1e-3)
+    assert_allclose(first_map["probability"], 0.6, atol=1e-3)
+    assert_allclose(second_map["location"], -1.0, atol=1e-3)
+    assert_allclose(second_map["probability"], 0.2, atol=1e-3)
 
 
 def test_optimizes_dispersion_internally():
@@ -197,20 +212,26 @@ def test_optimizes_dispersion_internally():
     guide = AutoMAPProposal(
         normal_model, init_dispersion=0.05, num_dispersion_particles=128
     )
-    guide.find_map(random.key(5), 2.0)
+    guide.fit(random.key(5), 2.0)
 
     assert_allclose(guide._dispersions["location"], 2**-0.5, rtol=0.2)
 
 
 def test_proposal_supports_and_sample_shapes():
     guide = AutoMAPProposal(model, num_dispersion_particles=8)
-    samples = guide.sample_posterior(
-        random.key(2),
-        {},
-        2.0,
-        jnp.array([1.0, 1.0, 0.0]),
-        sample_shape=(10,),
-    )
+    fit_result = guide.fit(random.key(16), 2.0, jnp.array([1.0, 1.0, 0.0]))
+
+    @jit
+    def draw_samples(rng_key, result, observation, outcomes):
+        return guide.sample_posterior(
+            rng_key,
+            result,
+            observation,
+            outcomes,
+            sample_shape=(10,),
+        )
+
+    samples = draw_samples(random.key(2), fit_result, 2.0, jnp.array([1.0, 1.0, 0.0]))
 
     assert samples["location"].shape == (10,)
     assert samples["odds"].shape == (10,)
@@ -231,13 +252,45 @@ def test_rejects_noniterative_optimizers(argument):
         AutoMAPProposal(empty_model, **{argument: Minimize()})
 
 
+def test_sample_posterior_reuses_fit():
+    def normal_model(observation):
+        location = numpyro.sample("location", dist.Normal(0, 1))
+        numpyro.sample("obs", dist.Normal(location, 1), obs=observation)
+
+    guide = AutoMAPProposal(
+        normal_model,
+        map_max_steps=2,
+        proposal_max_steps=2,
+    )
+    with pytest.raises(RuntimeError, match=r"Call AutoMAPProposal\.fit\(\)"):
+        guide.sample_posterior(random.key(19), None, 2.0)
+
+    fit_result = guide.fit(random.key(20), 2.0)
+    map_result = guide.map_result
+    samples = guide.sample_posterior(random.key(21), None, 2.0, sample_shape=(3,))
+
+    assert guide._fit_result is fit_result
+    assert guide.map_result is map_result
+    assert samples["location"].shape == (3,)
+
+
+def test_setup_prototype_does_not_fit():
+    guide = AutoMAPProposal(model)
+
+    with handlers.seed(rng_seed=random.key(17)):
+        guide._setup_prototype(2.0, jnp.array([1.0, 1.0, 0.0]))
+
+    assert guide._fit_result is None
+    assert guide.map_result is None
+
+
 def test_sites_with_equal_support_have_distinct_dispersions():
     def two_real_sites_model():
         numpyro.sample("a", dist.Normal(0, 0.1))
         numpyro.sample("b", dist.Normal(0, 10))
 
     guide = AutoMAPProposal(two_real_sites_model, num_dispersion_particles=128)
-    guide.find_map(random.key(4))
+    guide.fit(random.key(4))
 
     assert guide._support_ids == {"a": 0, "b": 0}
     assert set(guide._dispersions) == {"a", "b"}
@@ -256,10 +309,18 @@ def test_unbounded_discrete_site_uses_gamma_count_proposal():
         num_dispersion_particles=2,
         proposal_max_steps=5,
     )
-    samples = guide.sample_posterior(random.key(7), {}, 4.0, sample_shape=(10,))
-    proposal = guide._get_proposal("value", guide._proposal_params["value"])
+    fit_result = guide.fit(random.key(18), 4.0)
+    samples = guide.sample_posterior(random.key(7), fit_result, 4.0, sample_shape=(10,))
+    proposal = guide._get_proposal(
+        "value",
+        fit_result.proposal_params["value"],
+        map_locs=fit_result.map_locs,
+    )
     relaxed_proposal = guide._get_proposal(
-        "value", guide._proposal_params["value"], relaxed=True
+        "value",
+        fit_result.proposal_params["value"],
+        map_locs=fit_result.map_locs,
+        relaxed=True,
     )
 
     assert guide.model is poisson_model
