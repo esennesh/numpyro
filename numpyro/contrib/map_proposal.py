@@ -9,7 +9,7 @@ from itertools import product
 import math
 from typing import Any, NamedTuple
 
-from jax import lax, random
+from jax import jit, lax, random
 import jax.numpy as jnp
 
 import numpyro
@@ -32,7 +32,7 @@ from numpyro.infer.initialization import init_to_uniform
 from numpyro.infer.util import helpful_support_errors, log_density
 from numpyro.optim import Adam, Minimize, _NumPyroOptim, optax_to_numpyro
 
-__all__ = ["AutoMAPProposal"]
+__all__ = ["AutoMAPProposal", "MAPProposalResult"]
 
 
 def _as_iterative_optimizer(optimizer):
@@ -55,11 +55,102 @@ def _as_iterative_optimizer(optimizer):
     return optax_to_numpyro(optimizer)
 
 
+class _MinimizeOptions(NamedTuple):
+    check_interval: int
+    max_steps: int
+    patience: int
+    tolerance: float
+
+
 class _OptimizationResult(NamedTuple):
     converged: bool
     losses: jnp.ndarray
     num_steps: int
     params: Any
+
+
+class MAPProposalResult(NamedTuple):
+    """Fitted state and diagnostics returned by :meth:`AutoMAPProposal.fit`.
+
+    ``map_estimate`` contains constrained relaxed-MAP values, while ``map_locs``
+    contains their unconstrained representations. ``proposal_params`` and
+    ``map_locs`` are sufficient to reconstruct the fitted proposal. The two
+    optimization results contain convergence flags, loss histories, and step
+    counts; ``proposal_result`` is ``None`` for finite-discrete-only models.
+    """
+
+    map_estimate: dict
+    map_locs: dict
+    map_result: _OptimizationResult
+    proposal_params: dict
+    proposal_result: _OptimizationResult | None
+
+
+def _minimize(args, initial_parameters, objective, optimizer, options, rng_key):
+    best_loss = math.inf
+    converged = False
+    loss_chunks = []
+    num_steps = 0
+    optimizer_state = optimizer.init(initial_parameters)
+    stalled_checks = 0
+    step_keys = random.split(rng_key, options.max_steps)
+
+    while num_steps < options.max_steps:
+        chunk_size = min(
+            options.check_interval,
+            options.max_steps - num_steps,
+        )
+        optimizer_state, losses = _run_optimization_chunk(
+            args,
+            objective,
+            optimizer,
+            optimizer_state,
+            step_keys[num_steps : num_steps + chunk_size],
+        )
+        loss_chunks.append(losses)
+        num_steps += chunk_size
+
+        current_loss = float(jnp.nanmean(losses))
+        loss_scale = (
+            options.tolerance * (1.0 + abs(best_loss))
+            if math.isfinite(best_loss)
+            else 0.0
+        )
+        if math.isfinite(current_loss) and (
+            not math.isfinite(best_loss) or current_loss < best_loss - loss_scale
+        ):
+            best_loss = current_loss
+            stalled_checks = 0
+        else:
+            stalled_checks += 1
+        if stalled_checks >= options.patience:
+            converged = math.isfinite(current_loss)
+            break
+
+    return _OptimizationResult(
+        converged=converged,
+        losses=jnp.concatenate(loss_chunks),
+        num_steps=num_steps,
+        params=optimizer.get_params(optimizer_state),
+    )
+
+
+@partial(jit, static_argnums=(1, 2))
+def _run_optimization_chunk(
+    args,
+    objective,
+    optimizer,
+    optimizer_state,
+    step_keys,
+):
+    def step(state, key):
+        def loss_fn(parameters):
+            return objective(parameters, args, key), None
+
+        (loss, _), state = optimizer.eval_and_stable_update(loss_fn, state)
+        return state, loss
+
+    return lax.scan(step, optimizer_state, step_keys)
 
 
 class _ShiftedCategorical(dist.Distribution):
@@ -103,9 +194,11 @@ class AutoMAPProposal(AutoGuide):
     A self-fitting, factorized proposal centered at a joint relaxed MAP estimate.
 
     This guide is intended for use as a proposal in algorithms such as SMC and
-    EM, rather than for optimization by :class:`~numpyro.infer.svi.SVI`. Each
-    invocation fits a proposal for the supplied model ``*args, **kwargs``. It
-    first computes the joint MAP estimate of the DSGD-smoothed target,
+    EM, rather than for optimization by :class:`~numpyro.infer.svi.SVI`. Call
+    :meth:`fit` to fit a proposal for particular model ``*args, **kwargs``.
+    Subsequent calls and calls to :meth:`sample_posterior` only sample from that
+    fitted proposal; they do not optimize it again. Fitting first computes the
+    joint MAP estimate of the DSGD-smoothed target,
 
     .. math::
 
@@ -245,33 +338,40 @@ class AutoMAPProposal(AutoGuide):
         self._dsgd_model = dsgd(model, smoothed_distributions=True, **dsgd_kwargs)
         self._event_dims = {}
         self._finite_distributions = {}
+        self._fit_result = None
         self._init_dispersion = init_dispersion
         self._map_locs = {}
-        self._map_max_steps = map_max_steps
         self._map_optimizer = _as_iterative_optimizer(
             Adam(step_size=0.01) if map_optimizer is None else map_optimizer
         )
-        self._map_tolerance = map_tolerance
+        self._map_options = _MinimizeOptions(
+            check_interval=termination_check_interval,
+            max_steps=map_max_steps,
+            patience=termination_patience,
+            tolerance=map_tolerance,
+        )
         self._num_dispersion_particles = num_dispersion_particles
-        self._proposal_max_steps = proposal_max_steps
         self._proposal_optimizer = _as_iterative_optimizer(
             Adam(step_size=0.01) if proposal_optimizer is None else proposal_optimizer
         )
+        self._proposal_options = _MinimizeOptions(
+            check_interval=termination_check_interval,
+            max_steps=proposal_max_steps,
+            patience=termination_patience,
+            tolerance=proposal_tolerance,
+        )
         self._proposal_params = {}
-        self._proposal_tolerance = proposal_tolerance
         self._smooth_transforms = {}
         self._support_ids = {}
         self._supports = []
-        self._termination_check_interval = termination_check_interval
-        self._termination_patience = termination_patience
         self._transforms = {}
         self.dispersion_result = None
         self.map_result = None
         super().__init__(model, init_loc_fn=self._relaxed_init_loc_fn, prefix=prefix)
 
     def __call__(self, *args, **kwargs):
-        if self.prototype_trace is None:
-            self._setup_prototype(*args, **kwargs)
+        if self._fit_result is None:
+            raise RuntimeError("Call AutoMAPProposal.fit() before sampling.")
 
         plates = self._create_plates(*args, **kwargs)
         result = {}
@@ -282,46 +382,33 @@ class AutoMAPProposal(AutoGuide):
                 for frame in site["cond_indep_stack"]:
                     stack.enter_context(plates[frame.name])
                 result[name] = numpyro.sample(
-                    name, self._get_proposal(name, self._proposal_params[name])
+                    name,
+                    self._get_proposal(
+                        name,
+                        self._fit_result.proposal_params[name],
+                        map_locs=self._fit_result.map_locs,
+                    ),
                 )
         return result
 
-    def _find_map(self, model_args, model_kwargs, rng_key):
-        def objective(unconstrained, key):
-            constrained = {
-                name: self._transforms[name](value)
-                for name, value in unconstrained.items()
-            }
-            seeded_model = handlers.seed(self.relaxed_model, rng_seed=key)
-            log_target, _ = log_density(
-                seeded_model, model_args, model_kwargs, constrained
-            )
-            return -log_target
-
-        self.map_result = self._optimize(
-            self._init_locs,
-            self._map_max_steps,
-            objective,
-            self._map_optimizer,
-            rng_key,
-            self._map_tolerance,
-        )
-        return self.map_result.params
-
     def _fit_finite_parameters(
-        self, model_args, model_kwargs, proposal_keys, parameters
+        self, map_locs, model_args, model_kwargs, parameters, proposal_keys
     ):
         if not self._finite_distributions:
             return parameters
         constrained = {
-            name: self._get_proposal(name, parameters[name]).sample(
-                proposal_keys[name], (self._num_dispersion_particles,)
-            )
-            for name in self._map_locs
+            name: self._get_proposal(
+                name,
+                parameters[name],
+                map_locs=map_locs,
+            ).sample(proposal_keys[name], (self._num_dispersion_particles,))
+            for name in map_locs
         }
         parameters = parameters.copy()
         for name in self._finite_distributions:
-            categories, low, map_value, valid = self._get_finite_metadata(name)
+            categories, low, map_value, valid = self._get_finite_metadata(
+                name, map_locs
+            )
             logits = jnp.full(jnp.shape(map_value) + (len(categories),), -jnp.inf)
             indices = product(*(range(size) for size in jnp.shape(map_value)))
             for index in indices:
@@ -348,7 +435,11 @@ class AutoMAPProposal(AutoGuide):
                     )
                     logits = logits.at[index + (category,)].set(expected_log_target)
             parameters[name] = {"logits": logits}
-            proposal = self._get_proposal(name, parameters[name])
+            proposal = self._get_proposal(
+                name,
+                parameters[name],
+                map_locs=map_locs,
+            )
             constrained[name] = proposal.sample(
                 proposal_keys[name], (self._num_dispersion_particles,)
             )
@@ -362,9 +453,10 @@ class AutoMAPProposal(AutoGuide):
             return None
         return self._get_count_relaxation(base_dist)
 
-    def _get_finite_metadata(self, name):
+    def _get_finite_metadata(self, name, map_locs=None):
+        map_locs = self._map_locs if map_locs is None else map_locs
         base_dist = self._finite_distributions[name]
-        map_value = self._transforms[name](self._map_locs[name])
+        map_value = self._transforms[name](map_locs[name])
         num_categories = self._smooth_transforms[name]._M
         if isinstance(base_dist, dist.DiscreteUniform):
             high = jnp.broadcast_to(base_dist.high, jnp.shape(map_value))
@@ -379,7 +471,8 @@ class AutoMAPProposal(AutoGuide):
         valid = categories <= (high - low)[..., None]
         return categories, low, map_value, valid
 
-    def _get_proposal(self, name, parameters, *, relaxed=False):
+    def _get_proposal(self, name, parameters, *, map_locs=None, relaxed=False):
+        map_locs = self._map_locs if map_locs is None else map_locs
         event_dim = self._event_dims[name]
         if name in self._count_relaxations:
             base = dist.GammaCount(
@@ -401,14 +494,14 @@ class AutoMAPProposal(AutoGuide):
                 raise ValueError(
                     "Finite proposals use exact Categorical coordinate updates."
                 )
-            _, low, _, valid = self._get_finite_metadata(name)
+            _, low, _, valid = self._get_finite_metadata(name, map_locs)
             logits = jnp.where(valid, parameters["logits"], -jnp.inf)
             base = dist.Categorical(logits=logits)
             if isinstance(self._finite_distributions[name], dist.DiscreteUniform):
                 base = _ShiftedCategorical(logits, low)
             return base.to_event(event_dim)
         scale = jnp.exp(parameters["log_scale"])
-        base = dist.Normal(self._map_locs[name], scale).to_event(event_dim)
+        base = dist.Normal(map_locs[name], scale).to_event(event_dim)
         return dist.TransformedDistribution(base, self._transforms[name])
 
     def _get_smooth_transform(self, distribution):
@@ -421,9 +514,9 @@ class AutoMAPProposal(AutoGuide):
             return None
         return self._get_smooth_transform(base_dist)
 
-    def _initial_proposal_params(self):
+    def _initial_proposal_params(self, map_locs):
         parameters = {}
-        for name, map_loc in self._map_locs.items():
+        for name, map_loc in map_locs.items():
             if name in self._count_relaxations:
                 map_value = self._transforms[name](map_loc)
                 dtype = jnp.result_type(map_value, float)
@@ -433,7 +526,9 @@ class AutoMAPProposal(AutoGuide):
                     "log_rate": jnp.log(jnp.maximum(map_value, minimum_rate)),
                 }
             elif name in self._finite_distributions:
-                categories, low, map_value, valid = self._get_finite_metadata(name)
+                categories, low, map_value, valid = self._get_finite_metadata(
+                    name, map_locs
+                )
                 map_category = jnp.clip(jnp.round(map_value) - low, 0, categories[-1])
                 logits = -jnp.square(categories - map_category[..., None])
                 parameters[name] = {"logits": jnp.where(valid, logits, 0.0)}
@@ -443,83 +538,46 @@ class AutoMAPProposal(AutoGuide):
                 }
         return parameters
 
-    def _optimize(
-        self,
-        initial_parameters,
-        max_steps,
-        objective,
-        optimizer,
-        rng_key,
-        tolerance,
-    ):
-        best_loss = math.inf
-        converged = False
-        loss_chunks = []
-        num_steps = 0
-        optimizer_state = optimizer.init(initial_parameters)
-        stalled_checks = 0
-        step_keys = random.split(rng_key, max_steps)
-
-        def step(state, key):
-            def loss_fn(parameters):
-                return objective(parameters, key), None
-
-            (loss, _), state = optimizer.eval_and_stable_update(loss_fn, state)
-            return state, loss
-
-        while num_steps < max_steps:
-            chunk_size = min(
-                self._termination_check_interval,
-                max_steps - num_steps,
-            )
-            optimizer_state, losses = lax.scan(
-                step,
-                optimizer_state,
-                step_keys[num_steps : num_steps + chunk_size],
-            )
-            loss_chunks.append(losses)
-            num_steps += chunk_size
-
-            current_loss = float(jnp.nanmean(losses))
-            loss_scale = tolerance * (1.0 + abs(best_loss))
-            if math.isfinite(current_loss) and (
-                not math.isfinite(best_loss) or current_loss < best_loss - loss_scale
-            ):
-                best_loss = current_loss
-                stalled_checks = 0
-            else:
-                stalled_checks += 1
-            if stalled_checks >= self._termination_patience:
-                converged = math.isfinite(current_loss)
-                break
-
-        return _OptimizationResult(
-            converged=converged,
-            losses=jnp.concatenate(loss_chunks),
-            num_steps=num_steps,
-            params=optimizer.get_params(optimizer_state),
+    def _map_objective(self, unconstrained, objective_args, rng_key):
+        model_args, model_kwargs = objective_args
+        constrained = {
+            name: self._transforms[name](value) for name, value in unconstrained.items()
+        }
+        seeded_model = handlers.seed(self.relaxed_model, rng_seed=rng_key)
+        log_target, _ = log_density(
+            seeded_model,
+            model_args,
+            model_kwargs,
+            constrained,
         )
+        return -log_target
 
-    def _proposal_objective(self, model_args, model_kwargs, parameters, rng_key):
+    def _proposal_objective(self, parameters, objective_args, rng_key):
+        map_locs, model_args, model_kwargs = objective_args
         constrained = {}
         log_q = jnp.zeros(self._num_dispersion_particles)
         model_key, proposal_key = random.split(rng_key)
         proposal_keys = {
             name: key
             for name, key in zip(
-                self._map_locs,
-                random.split(proposal_key, len(self._map_locs)),
+                map_locs,
+                random.split(proposal_key, len(map_locs)),
             )
         }
-        for name in self._map_locs:
+        for name in map_locs:
             if name in self._finite_distributions:
-                map_value = self._transforms[name](self._map_locs[name])
+                map_value = self._transforms[name](map_locs[name])
                 constrained[name] = jnp.broadcast_to(
                     map_value,
                     (self._num_dispersion_particles,) + jnp.shape(map_value),
                 )
                 continue
-            proposal = self._get_proposal(name, parameters[name], relaxed=True)
+            proposal = self._get_proposal(
+                name,
+                parameters[name],
+                map_locs=map_locs,
+                relaxed=True,
+            )
             constrained[name] = proposal.sample(
                 proposal_keys[name], (self._num_dispersion_particles,)
             )
@@ -612,47 +670,78 @@ class AutoMAPProposal(AutoGuide):
         if not self._event_dims:
             raise RuntimeError("AutoMAPProposal found no latent variables.")
 
-        optimizer_key = numpyro.prng_key()
-        assert optimizer_key is not None
+        self._dispersions = {}
+        self.dispersion_result = None
+        self._fit_result = None
+        self._map_locs = {}
+        self.map_result = None
+        self._proposal_params = {}
+
+    def fit(self, rng_key, *args, **kwargs):
+        """Fit and store a MAP-centered proposal for the supplied model inputs.
+
+        Prototype discovery runs at most once. The numerical model inputs are
+        then passed dynamically to JIT-compiled optimizer chunks. Calling this
+        method again reuses the prototype but refits both optimization phases.
+
+        :return: The reusable fitted proposal state and optimization diagnostics.
+        :rtype: MAPProposalResult
+        """
+        optimizer_key, prototype_key = random.split(rng_key)
+        if self.prototype_trace is None:
+            with handlers.block(), handlers.seed(rng_seed=prototype_key):
+                self._setup_prototype(*args, **kwargs)
+
+        self.dispersion_result = None
+        self._fit_result = None
+        self.map_result = None
         finite_key, map_key, proposal_key = random.split(optimizer_key, 3)
         with handlers.block():
-            self._map_locs = self._find_map(args, kwargs, map_key)
+            map_result = _minimize(
+                (args, kwargs),
+                self._init_locs,
+                self._map_objective,
+                self._map_optimizer,
+                self._map_options,
+                map_key,
+            )
+            map_locs = map_result.params
             proposal_keys = {
                 name: key
                 for name, key in zip(
-                    self._map_locs,
-                    random.split(finite_key, len(self._map_locs)),
+                    map_locs,
+                    random.split(finite_key, len(map_locs)),
                 )
             }
-            initial_parameters = self._initial_proposal_params()
+            initial_parameters = self._initial_proposal_params(map_locs)
             optimizable_parameters = {
                 name: parameters
                 for name, parameters in initial_parameters.items()
                 if name not in self._finite_distributions
             }
             if optimizable_parameters:
-
-                def objective(parameters, key):
-                    return self._proposal_objective(args, kwargs, parameters, key)
-
-                self.dispersion_result = self._optimize(
+                proposal_result = _minimize(
+                    (map_locs, args, kwargs),
                     optimizable_parameters,
-                    self._proposal_max_steps,
-                    objective,
+                    self._proposal_objective,
                     self._proposal_optimizer,
+                    self._proposal_options,
                     proposal_key,
-                    self._proposal_tolerance,
                 )
-                optimized_parameters = self.dispersion_result.params
+                optimized_parameters = proposal_result.params
             else:
-                self.dispersion_result = None
                 optimized_parameters = {}
-            self._proposal_params = initial_parameters.copy()
-            self._proposal_params.update(optimized_parameters)
-            self._proposal_params = self._fit_finite_parameters(
-                args, kwargs, proposal_keys, self._proposal_params
+                proposal_result = None
+            proposal_params = initial_parameters.copy()
+            proposal_params.update(optimized_parameters)
+            proposal_params = self._fit_finite_parameters(
+                map_locs,
+                args,
+                kwargs,
+                proposal_params,
+                proposal_keys,
             )
-            self._dispersions = {
+            dispersions = {
                 name: jnp.exp(
                     parameters[
                         "log_concentration"
@@ -660,35 +749,57 @@ class AutoMAPProposal(AutoGuide):
                         else "log_scale"
                     ]
                 )
-                for name, parameters in self._proposal_params.items()
+                for name, parameters in proposal_params.items()
                 if name not in self._finite_distributions
             }
 
-    def find_map(self, rng_key, *args, **kwargs):
-        """Fit the proposal and return its constrained relaxed-MAP centers."""
-        with handlers.block(), handlers.seed(rng_seed=rng_key):
-            self._setup_prototype(*args, **kwargs)
-        return {
-            name: self._transforms[name](value)
-            for name, value in self._map_locs.items()
+        map_estimate = {
+            name: self._transforms[name](value) for name, value in map_locs.items()
         }
+        fit_result = MAPProposalResult(
+            map_estimate=map_estimate,
+            map_locs=map_locs,
+            map_result=map_result,
+            proposal_params=proposal_params,
+            proposal_result=proposal_result,
+        )
+        self._dispersions = dispersions
+        self.dispersion_result = proposal_result
+        self._fit_result = fit_result
+        self._map_locs = map_locs
+        self.map_result = map_result
+        self._proposal_params = proposal_params
+        return fit_result
 
     def relaxed_model(self, *args, **kwargs):
         """Evaluate the DSGD-relaxed target at the configured temperature."""
         return self._dsgd_model(self._discrete_temperature, *args, **kwargs)
 
-    def sample_posterior(self, rng_key, params=None, *args, sample_shape=(), **kwargs):
-        """Fit once for the supplied inputs, then draw exact proposal samples."""
-        setup_key, sample_key = random.split(rng_key)
-        with handlers.block(), handlers.seed(rng_seed=setup_key):
-            self._setup_prototype(*args, **kwargs)
+    def sample_posterior(
+        self, rng_key, fit_result=None, *args, sample_shape=(), **kwargs
+    ):
+        """Draw exact samples from a proposal previously fitted by :meth:`fit`.
 
-        names = tuple(self._map_locs)
+        Pass the returned :class:`MAPProposalResult` as ``fit_result``, or omit
+        it to use the most recent fit. ``sample_shape`` controls the arbitrary
+        batch of proposal draws. No optimization occurs here.
+        """
+        if fit_result is None:
+            fit_result = self._fit_result
+        if fit_result is None:
+            raise RuntimeError("Call AutoMAPProposal.fit() before sampling.")
+        if not isinstance(fit_result, MAPProposalResult):
+            raise TypeError("fit_result must be the result returned by fit().")
+
+        names = tuple(fit_result.map_locs)
+        predictive_key, sample_key = random.split(rng_key)
         sample_keys = random.split(sample_key, len(names))
         samples = {
-            name: self._get_proposal(name, self._proposal_params[name]).sample(
-                key, sample_shape
-            )
+            name: self._get_proposal(
+                name,
+                fit_result.proposal_params[name],
+                map_locs=fit_result.map_locs,
+            ).sample(key, sample_shape)
             for name, key in zip(names, sample_keys)
         }
         prototype_trace = self.prototype_trace
@@ -705,5 +816,5 @@ class AutoMAPProposal(AutoGuide):
                 return_sites=deterministic_sites,
                 batch_ndims=len(sample_shape),
             )
-            samples.update(predictive(sample_key, *args, **kwargs))
+            samples.update(predictive(predictive_key, *args, **kwargs))
         return samples
