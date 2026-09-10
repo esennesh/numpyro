@@ -539,13 +539,64 @@ class _IdxSpec:
         self.params = params
 
 
-def _idx_spec(d) -> Optional["_IdxSpec"]:
+# Floor on the gate charge that sets the log-sum bump's exponent.  Below it the
+# spike is no larger than the slab at k = 1, zero inflation buys no sparsity,
+# and the bump degenerates smoothly to the plain profile
+# ``1 - log1p(k / w) / log1p(1 / w)``.
+_ZERO_BUMP_MIN_CHARGE = 1e-3
+
+
+def _zero_bump(k, zero_width, charge):
+    r"""Log-sum continuation of the zero-inflation indicator :math:`1[k = 0]`.
+
+    Exact on the integers (1 at 0, 0 at every :math:`k \ge 1`) and, on
+    :math:`(0, 1)`, shaped so that the relaxed cost of a mark
+    :math:`-\log[\mathrm{gate}\,b(z)]` grows like the log-sum penalty
+
+        :math:`C \, \log(1 + z / w) / \log(1 + 1 / w)`
+
+    from 0 at :math:`z = 0` to the full gate charge :math:`C` at :math:`z = 1`,
+    where :math:`C = \log \mathrm{gate} - \log[(1 - \mathrm{gate})\,p_{\rm
+    base}(1)]` is the log-ratio of the spike to the slab at 1.  Writing
+    :math:`\alpha = C / \log(1 + 1/w)`,
+
+        :math:`b(z) = \frac{(1 + z/w)^{-\alpha} - (1 + 1/w)^{-\alpha}}
+        {1 - (1 + 1/w)^{-\alpha}}`,
+
+    evaluated through ``expm1`` so small :math:`\alpha` is stable.  The cost is
+    concave over most of the unit interval, so the marginal price of a mark
+    falls as the mark grows: faint marks are charged at :math:`C / (w \log(1 +
+    1/w))` nats per unit, and any mark well above ``zero_width`` is charged the
+    gate nearly in full.  ``zero_width`` :math:`w \in (0, 1]` sets where the
+    charge is concentrated; :class:`SmoothedCount` ties it to the temperature as
+    :math:`\min(\eta, 1)`, so the continuation tends to the exact step as
+    :math:`\eta \to 0`.
+
+    :param k: relaxed count, real ``>= 0``.
+    :param zero_width: bump width in ``(0, 1]``; may be traced.
+    :param charge: full gate charge :math:`C` (floored at a small positive
+        value so the exponent stays positive).
+    """
+    w = jnp.clip(zero_width, jnp.finfo(jnp.result_type(float)).tiny, 1.0)
+    alpha = jnp.maximum(charge, _ZERO_BUMP_MIN_CHARGE) / jnp.log1p(1.0 / w)
+    a = jnp.log1p(jnp.clip(k, 0.0, 1.0) / w)
+    b = jnp.log1p(1.0 / w)
+    bump = jnp.exp(-alpha * a) * jnp.expm1(-alpha * (b - a)) / jnp.expm1(-alpha * b)
+    return jnp.where(k >= 1.0, 0.0, jnp.clip(bump, 0.0, 1.0))
+
+
+def _idx_spec(d, zero_width=1.0) -> Optional["_IdxSpec"]:
     """Return an :class:`_IdxSpec` for supported unbounded families (Poisson,
     Geometric, GammaCount, GammaPoisson / NegativeBinomial and their
     zero-inflated wrappers), else ``None``. ``log_pmf(k, params)`` is the
     analytic continuation of the discrete log-pmf (valid for real ``k >= 0``):
     it is consumed with integer ``k`` inside the accumulation and with the
-    continuous relaxed count as the :class:`SmoothedCount` density term."""
+    continuous relaxed count as the :class:`SmoothedCount` density term.
+
+    ``zero_width`` is the width of the log-sum bump :func:`_zero_bump` that
+    continues a zero-inflated wrapper's indicator ``1[k == 0]`` off the
+    integers.  It only affects non-integer ``k``, so callers that evaluate the
+    spec on the integers (the accumulation) may leave the default."""
     ftype = jnp.result_type(float)
 
     if isinstance(d, Poisson):
@@ -589,7 +640,7 @@ def _idx_spec(d) -> Optional["_IdxSpec"]:
     if isinstance(d, ZeroInflatedProbs):
         # Zero-inflation adds a point mass ``gate`` at 0 to the base family.
         # Covers ZeroInflatedLogits / ZeroInflatedPoisson (subclasses).
-        base = _idx_spec(d.base_dist)
+        base = _idx_spec(d.base_dist, zero_width)
         if base is None:
             return None
         params = {
@@ -599,13 +650,22 @@ def _idx_spec(d) -> Optional["_IdxSpec"]:
 
         def log_pmf(k, p):
             # Mixture form log[(1 - gate) p_base(k) + gate * 1[k == 0]].  ``bump``
-            # is a smooth surrogate for the indicator 1[k == 0]: exact on the
-            # integers (1 at 0, 0 at every k >= 1), so the accumulation and the
-            # eta -> 0 limit are unchanged, but continuous in the relaxed count so
-            # the density term is well-defined at non-integer z.
-            bump = jnp.clip(1.0 - k, 0.0, 1.0)
-            base_p = jnp.exp(base.log_pmf(k, p["base"]))
-            mix = (1.0 - p["gate"]) * base_p + p["gate"] * bump
+            # is the log-sum continuation of the indicator 1[k == 0]
+            # (_zero_bump): exact on the integers (1 at 0, 0 at every k >= 1),
+            # so the accumulation and the eta -> 0 limit are unchanged, and
+            # shaped between them so the gate is charged nearly in full for any
+            # mark above ``zero_width``.  A linear bump (clip(1 - k, 0, 1)) was
+            # used before: it spreads the gate charge as a convex ramp across
+            # (0, 1), which makes a faint mark *cheaper* than under the
+            # un-inflated base family and removes the sparsity zero inflation is
+            # chosen for.
+            gate = p["gate"]
+            base_log_p = base.log_pmf(k, p["base"])
+            charge = jnp.log(gate) - (
+                jnp.log1p(-gate) + base.log_pmf(jnp.ones_like(k), p["base"])
+            )
+            bump = _zero_bump(k, zero_width, charge)
+            mix = (1.0 - gate) * jnp.exp(base_log_p) + gate * bump
             return jnp.log(jnp.clip(mix, 1e-45, None))
 
         return _IdxSpec(log_pmf, params)
@@ -620,6 +680,19 @@ def _idx_spec(d) -> Optional["_IdxSpec"]:
 _COUNT_WINDOW = 256
 _COUNT_MAX = 100_000
 _COUNT_ANCHORS = ("binary", "cornish-fisher")
+
+
+def _validate_zero_width(zero_width):
+    """Reject a concrete ``zero_width`` outside ``(0, 1]``; traced values are
+    clipped at evaluation time instead."""
+    if zero_width is None or isinstance(zero_width, jax.core.Tracer):
+        return
+    value = jnp.asarray(zero_width)
+    if value.ndim == 0 and not (0.0 < float(value) <= 1.0):
+        raise ValueError(
+            f"zero_width must lie in (0, 1] (a wider bump is non-zero at k = 1 "
+            f"and breaks exactness on the integers); got {float(value)}"
+        )
 
 
 def _validate_count_anchor(anchor):
@@ -1267,6 +1340,38 @@ class SmoothedCount(dist.Distribution):
     needs no transform inversion; it is evaluated directly with gamma and
     incomplete-gamma functions.
 
+    **Zero inflation.**  A zero-inflated wrapper's log-pmf has the mixture form
+    :math:`\log[(1 - g)\,p_{\rm base}(k) + g\,1[k = 0]]`, and the indicator
+    has no canonical continuation.  Between the integers the choice decides
+    whether zero inflation still buys sparsity: the gate's whole charge,
+    :math:`C = \log g - \log[(1 - g)\,p_{\rm base}(1)]` nats for one
+    occurrence, has to be paid *somewhere* on :math:`(0, 1)`, and a first-order
+    optimiser feels only the slope where the relaxed count sits.  A linear bump
+    ``clip(1 - z, 0, 1)`` spreads the charge as a convex ramp, so a faint mark
+    costs :math:`-\log(1 - z)` -- about one nat per unit near zero, *cheaper*
+    than the un-inflated base family -- and a diffuse solution of many faint
+    marks beats a sparse one.  This class instead continues the indicator with
+    the log-sum bump :func:`_zero_bump`, whose cost on :math:`(0, 1)` is
+
+        :math:`C \, \log(1 + z / w) / \log(1 + 1 / w)`,
+
+    a concave penalty (the usual continuous relaxation of an :math:`\ell_0`
+    count) rising from 0 to the full charge :math:`C` at :math:`z = 1`.  Its
+    marginal price falls as a mark grows, so faint marks are expensive per unit
+    and the symmetric state of many faint marks is unstable: mass concentrates
+    onto few sites.  The width ``zero_width`` :math:`w \in (0, 1]` sets where
+    the charge concentrates.  By default it is tied to the temperature,
+    :math:`w = \min(\eta, 1)`: wide early in the :func:`eta_schedule`, when
+    the price of creating a mark is affordable, and narrowing with
+    :math:`\eta` so the continuation tends to the exact step.  (A width above
+    1 would make the bump non-zero at :math:`k = 1` and break exactness on the
+    integers, hence the cap.)  Under this coupling the relaxed prior tracks the
+    exact zero-inflated cost for any mark above :math:`w`, whereas with the
+    linear bump, and with a *narrowed* linear bump alike, it does not: the
+    linear bump is flat beyond its wall and convex inside it, so annealing its
+    width extinguishes every faint mark instead of concentrating them.  All of
+    this concerns the density term only; the relaxed *sample* is unaffected.
+
     :param base_dist: an unbounded discrete Distribution supported by
         :func:`_idx_spec` (Poisson, Geometric, GammaCount, GammaPoisson /
         NegativeBinomial, or a zero-inflated wrapper).
@@ -1277,10 +1382,13 @@ class SmoothedCount(dist.Distribution):
     :param int max_count: inclusive upper bound of the binary anchor's search;
         a correctness bound rather than a speed knob, see
         :func:`anchored_relaxed_count` and :func:`count_anchor_saturates`.
+    :param zero_width: width of the zero-inflation bump in ``(0, 1]``; ``None``
+        (default) ties it to the temperature as ``min(eta, 1)``.  Only used for
+        zero-inflated wrappers.  May be traced.
     """
 
     arg_constraints = {}
-    pytree_data_fields = ("base_dist", "eta")
+    pytree_data_fields = ("base_dist", "eta", "zero_width")
     pytree_aux_fields = ("anchor", "width", "max_count")
     support = constraints.positive
     has_rsample = True
@@ -1293,18 +1401,26 @@ class SmoothedCount(dist.Distribution):
         anchor="binary",
         width=_COUNT_WINDOW,
         max_count=_COUNT_MAX,
+        zero_width=None,
         validate_args=None,
     ):
         _validate_count_anchor(anchor)
+        _validate_zero_width(zero_width)
         self.base_dist = base_dist
         self.eta = eta
         self.anchor = anchor
         self.width = width
         self.max_count = max_count
+        self.zero_width = zero_width
         super().__init__(batch_shape=base_dist.batch_shape, validate_args=validate_args)
 
+    def _zero_width(self):
+        if self.zero_width is None:
+            return jnp.minimum(self.eta, 1.0)
+        return self.zero_width
+
     def _spec(self) -> "_IdxSpec":
-        spec = _idx_spec(self.base_dist)
+        spec = _idx_spec(self.base_dist, self._zero_width())
         if spec is None:
             raise ValueError(
                 f"SmoothedCount: unsupported distribution "
@@ -1479,6 +1595,7 @@ def SmoothedDiscrete(
     anchor="binary",
     width=_COUNT_WINDOW,
     max_count=_COUNT_MAX,
+    zero_width=None,
 ):
     """
     Wrap a discrete distribution so that samples are drawn from a smooth
@@ -1523,6 +1640,10 @@ def SmoothedDiscrete(
         (default) or ``"cornish-fisher"``.
     :param int width: recurrence terms retained on each side of the count anchor.
     :param int max_count: upper search bound used by the binary anchor.
+    :param zero_width: width in ``(0, 1]`` of the log-sum bump that continues a
+        zero-inflated wrapper's indicator between the integers; ``None``
+        (default) ties it to the temperature as ``min(eta, 1)``.  See
+        :class:`SmoothedCount`.
     :return: a smoothed distribution approximating base_dist.
     """
 
@@ -1531,7 +1652,12 @@ def SmoothedDiscrete(
     def build(d):
         if _use_count_relaxation(d, max_support):
             return SmoothedCount(
-                d, eta, anchor=anchor, width=width, max_count=max_count
+                d,
+                eta,
+                anchor=anchor,
+                width=width,
+                max_count=max_count,
+                zero_width=zero_width,
             )
         return SmoothedFinite(d, eta, max_support)
 
@@ -1733,6 +1859,10 @@ class DSGDMessenger(Messenger):
         (default) or ``"cornish-fisher"``.
     :param int width: recurrence terms retained on each side of the count anchor.
     :param int max_count: upper search bound used by the binary anchor.
+    :param zero_width: width in ``(0, 1]`` of the log-sum bump that continues a
+        zero-inflated wrapper's indicator between the integers; ``None``
+        (default) ties it to the temperature as ``min(eta, 1)``.  See
+        :class:`SmoothedCount`.
     """
 
     def __init__(
@@ -1744,14 +1874,17 @@ class DSGDMessenger(Messenger):
         anchor="binary",
         width=_COUNT_WINDOW,
         max_count=_COUNT_MAX,
+        zero_width=None,
     ):
         _validate_count_anchor(anchor)
+        _validate_zero_width(zero_width)
         self.eta = eta
         self.smoothed_distributions = smoothed_distributions
         self.max_support = max_support
         self.anchor = anchor
         self.width = width
         self.max_count = max_count
+        self.zero_width = zero_width
         super().__init__()
 
     def process_message(self, msg):
@@ -1773,6 +1906,7 @@ class DSGDMessenger(Messenger):
                     anchor=self.anchor,
                     width=self.width,
                     max_count=self.max_count,
+                    zero_width=self.zero_width,
                 )
             # Straight-through: replace fn with a distribution whose sample is
             # round(z) + (z − stop_gradient(z)).  Replacing fn (rather than
@@ -1851,6 +1985,7 @@ def dsgd(
     anchor="binary",
     width=_COUNT_WINDOW,
     max_count=_COUNT_MAX,
+    zero_width=None,
 ):
     """
     Transform a NumPyro model to use DSGD smoothing at all discrete sites.
@@ -1886,6 +2021,10 @@ def dsgd(
         (default) or ``"cornish-fisher"``.
     :param int width: recurrence terms retained on each side of the count anchor.
     :param int max_count: upper search bound used by the binary anchor.
+    :param zero_width: width in ``(0, 1]`` of the log-sum bump that continues a
+        zero-inflated wrapper's indicator between the integers; ``None``
+        (default) ties it to the temperature as ``min(eta, 1)``.  See
+        :class:`SmoothedCount`.
     :return: ``smoothed_fn(eta, *args, **kwargs)`` — a callable that wraps
         the model under :class:`DSGDMessenger`.
     """
@@ -1898,6 +2037,7 @@ def dsgd(
             anchor=anchor,
             width=width,
             max_count=max_count,
+            zero_width=zero_width,
         ):
             return model(*args, **kwargs)
 

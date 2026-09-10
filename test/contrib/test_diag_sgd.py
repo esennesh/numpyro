@@ -23,6 +23,7 @@ from numpyro.contrib.diag_sgd import (
     _finite_soft_weights,
     _idx_spec,
     _unvalidated_log_prob,
+    _zero_bump,
     adaptive_relaxed_count,
     anchored_relaxed_count,
     count_anchor_saturates,
@@ -1693,21 +1694,137 @@ def test_count_log_pmf_broadcasts_over_recurrence_axis(family):
         )
 
 
-def test_idx_spec_zero_inflated_smooths_the_indicator():
+ZERO_INFLATED_FAMILIES = {
+    "poisson": lambda: dist.ZeroInflatedPoisson(jnp.asarray(0.3), jnp.asarray(2.0)),
+    "sparse_poisson": lambda: dist.ZeroInflatedPoisson(
+        jnp.asarray(1.0 - 2.0 / 230400.0), jnp.asarray(0.5)
+    ),
+    "geometric": lambda: dist.ZeroInflatedDistribution(
+        dist.GeometricProbs(jnp.asarray(0.4)), gate=jnp.asarray(0.6)
+    ),
+    "gamma_poisson": lambda: dist.ZeroInflatedDistribution(
+        dist.GammaPoisson(jnp.asarray(3.0), jnp.asarray(1.5)), gate=jnp.asarray(0.9)
+    ),
+}
+
+
+@pytest.mark.parametrize("family", sorted(ZERO_INFLATED_FAMILIES))
+@pytest.mark.parametrize("zero_width", [1.0, 0.1, 0.001])
+def test_idx_spec_zero_inflated_smooths_the_indicator(family, zero_width):
     # The zero-inflated _idx_spec continuation is deliberately NOT log_prob: it
-    # replaces 1[k == 0] with a smooth bump so the density term is defined at
-    # non-integer relaxed counts.  It must still agree on the integers.
-    base_dist = dist.ZeroInflatedPoisson(jnp.asarray(0.3), jnp.asarray(2.0))
-    spec = _idx_spec(base_dist)
+    # replaces 1[k == 0] with the log-sum bump so the density term is defined at
+    # non-integer relaxed counts.  It must still agree on the integers, for
+    # every width.
+    base_dist = ZERO_INFLATED_FAMILIES[family]()
+    spec = _idx_spec(base_dist, zero_width)
 
     integers = jnp.arange(6.0)
     assert_allclose(
         spec.log_pmf(integers, spec.params), base_dist.log_prob(integers), atol=1e-5
     )
 
+    # Off the integers it is the mixture with the log-sum bump in place of the
+    # indicator, not the distribution's own log_prob.
     between = jnp.asarray([0.4, 0.8])
-    continued = _unvalidated_log_prob(base_dist, between)
-    assert jnp.all(jnp.abs(spec.log_pmf(between, spec.params) - continued) > 0.1)
+    gate = base_dist.gate
+    base_p = jnp.exp(_unvalidated_log_prob(base_dist.base_dist, between))
+    charge = jnp.log(gate) - jnp.log1p(-gate) - base_dist.base_dist.log_prob(1)
+    expected = jnp.log(
+        (1 - gate) * base_p + gate * _zero_bump(between, zero_width, charge)
+    )
+    assert_allclose(spec.log_pmf(between, spec.params), expected, atol=1e-5)
+
+
+def test_zero_bump_is_an_exact_decreasing_indicator():
+    # 1 at 0, exactly 0 from k = 1 on, strictly decreasing in between, and
+    # well-behaved when the gate charge is at (or below) the floor.
+    for zero_width in (1.0, 0.1, 0.01):
+        for charge in (12.85, 0.5, 1e-3, -3.0):
+            ks = jnp.linspace(0.0, 1.0, 501)
+            bump = _zero_bump(ks, zero_width, charge)
+            assert_allclose(bump[0], 1.0, atol=1e-6)
+            assert_allclose(bump[-1], 0.0, atol=1e-6)
+            assert jnp.all(jnp.diff(bump) < 0.0)
+            assert_allclose(
+                _zero_bump(jnp.asarray([1.0, 1.5, 7.0]), zero_width, charge), 0.0
+            )
+            assert jnp.all(jnp.isfinite(bump))
+
+
+def test_zero_inflated_cost_is_the_log_sum_penalty():
+    # For a sparse gate the slab is negligible on (0, 1), so the relaxed cost of
+    # a mark should follow C log(1 + z/w) / log(1 + 1/w) with C the full gate
+    # charge, and its marginal price should fall as the mark grows.
+    base_dist = ZERO_INFLATED_FAMILIES["sparse_poisson"]()
+    charge = base_dist.log_prob(0) - base_dist.log_prob(1)
+    for zero_width in (1.0, 0.1, 0.01):
+        smoothed = SmoothedCount(base_dist, eta=0.5, zero_width=zero_width)
+        z = jnp.asarray([0.05, 0.2, 0.5, 0.8])
+        cost = smoothed.log_prob(0.0) - smoothed.log_prob(z)
+        expected = charge * jnp.log1p(z / zero_width) / jnp.log1p(1.0 / zero_width)
+        assert_allclose(cost, expected, rtol=0.02)
+        price = jax.vmap(jax.grad(lambda x: -smoothed.log_prob(x)))(z)
+        assert jnp.all(jnp.diff(price) < 0.0)
+
+
+def test_smoothed_count_zero_width_follows_eta():
+    # Default: zero_width = min(eta, 1), also when eta is traced under jit.
+    base_dist = ZERO_INFLATED_FAMILIES["sparse_poisson"]()
+    z = jnp.asarray([0.01, 0.3, 0.7])
+    for eta in (5.0, 1.0, 0.1, 0.01):
+        by_default = SmoothedCount(base_dist, eta).log_prob(z)
+        explicit = SmoothedCount(base_dist, eta, zero_width=min(eta, 1.0)).log_prob(z)
+        assert_allclose(by_default, explicit, atol=1e-6)
+
+    traced = jit(lambda eta: SmoothedCount(base_dist, eta).log_prob(z))
+    assert_allclose(traced(0.1), SmoothedCount(base_dist, 0.1).log_prob(z), atol=1e-6)
+    assert_allclose(traced(3.0), SmoothedCount(base_dist, 1.0).log_prob(z), atol=1e-6)
+
+    with pytest.raises(ValueError, match="zero_width"):
+        SmoothedCount(base_dist, 0.1, zero_width=1.5)
+    with pytest.raises(ValueError, match="zero_width"):
+        dsgd(lambda: None, zero_width=0.0)(0.1)
+
+
+def test_zero_inflated_relaxed_prior_prefers_sparse_solutions():
+    # The scenario from the zero-inflation issue: 230,400 sites at an expected
+    # total count of 1.  Two coefficients at 1.0 must beat 1,682 coefficients
+    # sharing the same amplitude, as they do under the exact discrete model.
+    base_dist = ZERO_INFLATED_FAMILIES["sparse_poisson"]()
+    plain = SmoothedCount(dist.Poisson(jnp.asarray(1.0 / 230400.0)), eta=0.01)
+    smoothed = SmoothedCount(base_dist, eta=0.01)
+    faint = jnp.asarray(2.0 / 1682.0)
+
+    def cost(d, z):
+        return d.log_prob(0.0) - d.log_prob(z)
+
+    sparse = 2.0 * cost(smoothed, 1.0)
+    diffuse = 1682.0 * cost(smoothed, faint)
+    assert sparse < diffuse
+    # A faint mark is dearer under zero inflation than under the base family
+    # with the same expected total count (the linear bump inverted this).
+    assert cost(smoothed, faint) > cost(plain, faint)
+    # And a full occurrence costs exactly what the discrete model charges.
+    assert_allclose(
+        cost(smoothed, 1.0), base_dist.log_prob(0) - base_dist.log_prob(1), atol=1e-4
+    )
+
+
+def test_zero_inflated_relaxed_density_has_finite_gradients():
+    # Value, gate and rate gradients stay finite across the bump, at its edges,
+    # and past k = 1 where the bump is identically zero.
+    z = jnp.asarray([1e-6, 0.01, 0.5, 1.0 - 1e-6, 1.0, 1.5, 3.0])
+
+    def log_density(gate, rate, value):
+        d = dist.ZeroInflatedPoisson(gate, rate)
+        return jnp.sum(SmoothedCount(d, eta=0.05).log_prob(value))
+
+    for gate in (0.3, 0.99, 1.0 - 1e-5):
+        grads = jax.grad(log_density, argnums=(0, 1, 2))(
+            jnp.asarray(gate), jnp.asarray(0.5), z
+        )
+        for g in grads:
+            assert jnp.all(jnp.isfinite(g))
 
 
 @pytest.mark.parametrize("family", sorted(COUNT_FAMILIES))
