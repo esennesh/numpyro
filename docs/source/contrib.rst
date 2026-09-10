@@ -405,6 +405,39 @@ accumulates the CDF from the continued log-pmf in a :func:`jax.lax.while_loop`
 and takes distribution-parameter gradients with forward-mode automatic
 differentiation through a custom reverse-mode rule).
 
+**Zero inflation and sparsity.**  A zero-inflated wrapper's log-pmf is the
+mixture :math:`\log[(1 - g)\,p_{\rm base}(k) + g\,1[k = 0]]`, and the
+indicator :math:`1[k = 0]` has no canonical continuation to non-integer
+relaxed counts.  The choice matters: for one occurrence the gate charges
+:math:`C = \log g - \log[(1 - g)\,p_{\rm base}(1)]` nats, and a first-order
+optimiser only ever feels the slope of the continuation where the relaxed count
+sits.  A linear bump ``clip(1 - z, 0, 1)`` spreads that charge as a convex ramp
+over :math:`(0, 1)`, so a faint mark costs :math:`-\log(1 - z)`, about one nat
+per unit near zero -- cheaper than under the un-inflated base family -- and a
+diffuse solution of many faint marks beats a sparse one, which is the opposite
+of what zero inflation is chosen for.
+:class:`~numpyro.contrib.diag_sgd.SmoothedCount` therefore continues the
+indicator with a *log-sum bump* whose cost on :math:`(0, 1)` is
+
+.. math::
+
+    C \, \frac{\log(1 + z / w)}{\log(1 + 1 / w)},
+
+a concave penalty (the usual continuous relaxation of an :math:`\ell_0` count)
+that rises from 0 to the full charge :math:`C` at :math:`z = 1` and is exact on
+the integers.  Its marginal price *falls* as a mark grows, so faint marks are
+expensive per unit and a symmetric state of many faint marks is unstable: mass
+concentrates onto few sites.  The width :math:`w \in (0, 1]` (``zero_width``)
+sets where the charge concentrates and is tied to the temperature by default,
+:math:`w = \min(\eta, 1)`.  Early in the :func:`~numpyro.contrib.diag_sgd.eta_schedule`
+the bump is wide and the price of creating a mark is affordable; as
+:math:`\eta` falls the bump narrows and the continuation tends to the exact
+step.  (The cap at 1 is needed because a wider bump is non-zero at :math:`k =
+1` and breaks exactness on the integers.)  The linear bump is not recoverable by
+narrowing its width: it is flat beyond its wall and convex inside it, so
+annealing it extinguishes every faint mark rather than concentrating them.  This
+concerns the density term only; the relaxed sample is unchanged.
+
 Typical usage anneals :math:`\\eta` over training::
 
     from numpyro.contrib.diag_sgd import dsgd, count_layers, eta_schedule
