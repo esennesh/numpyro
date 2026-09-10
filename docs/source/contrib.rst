@@ -338,27 +338,69 @@ by a smooth inverse-CDF reparameterisation controlled by a temperature
 original one, and [1] (Theorem 5.6) gives an :math:`\eta`-schedule under which the
 DSGD gradient estimator converges almost surely to stationary points.
 
-Finite-support families use the grid inverse-CDF
-:class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform`. Unbounded families
-(Poisson, Geometric, GammaPoisson / NegativeBinomial, and their zero-inflated
-wrappers) instead use the adaptive index-space relaxed count
-:func:`~numpyro.contrib.diag_sgd.adaptive_relaxed_count`. Writing
-:math:`a_k = \sigma_\eta(u - F(k))` and
-:math:`w_k = a_{k-1} - a_k`, it returns the convex combination
+Every discrete site is relaxed in *index space*. Writing
+:math:`a_k = \sigma_\eta(u - F(k))` for the CDF :math:`F` and soft one-hot
+weights :math:`w_k = a_{k-1} - a_k`, the relaxed sample is the convex
+combination of the support points
 
 .. math::
 
-    Q_\eta(u) = \frac{\sum_{k=0}^{\infty} k w_k}
-                         {\sum_{k=0}^{\infty} w_k}.
+    Q_\eta(u) = \frac{\sum_{k} k w_k}{\sum_{k} w_k},
 
-The implementation accumulates the CDF from the analytically continued log-pmf
-and discovers a finite numerical horizon at runtime, stopping after the pmf has
-passed its mode and decayed below a relative tolerance. Because this requires a
-:func:`jax.lax.while_loop`, distribution-parameter gradients use forward-mode
-automatic differentiation through a custom reverse-mode rule. The corresponding
-:class:`~numpyro.contrib.diag_sgd.SmoothedCount` evaluates the analytically
-continued discrete log-pmf at the relaxed count instead of using a
-change-of-variables density.
+and the density term of the smoothed objective is the *analytic continuation of
+the discrete log-pmf* evaluated at :math:`Q_\eta(u)` -- for a Bernoulli
+:math:`z \log p + (1 - z) \log(1 - p)`, for a Poisson
+:math:`z \log \lambda - \lambda - \log\Gamma(z + 1)`, for a Categorical the
+linear interpolation of :math:`\log p_k` between neighbouring categories.
+The change-of-variables pushforward density of the smooth inverse-CDF is *not*
+used: for a Bernoulli it does not depend on :math:`p` at all, so
+:math:`\log p - \log q` would vanish identically, and for unbounded families it
+diverges for near-deterministic distributions. The continued log-pmf is bounded,
+exact on the integers, and makes :math:`\mathbb{E}_q[\log p - \log q]` a
+:math:`-\mathrm{KL}` surrogate that is exact when the soft one-hot weights of
+the relaxed sample have the right expectations (:math:`\mathbb{E}_q[w_k] = q_k`;
+for a Bernoulli, :math:`\mathbb{E}_q[z] = q`) and otherwise off by a mean bias
+that vanishes as :math:`\eta \to 0`.
+
+Finite-support families (Bernoulli, Categorical, Binomial, DiscreteUniform) use
+:class:`~numpyro.contrib.diag_sgd.SmoothedFinite`, whose sample is the
+normalised relaxation :func:`~numpyro.contrib.diag_sgd.relaxed_finite_index`
+over the CDF grid, with end caps :math:`a_{-1} = \sigma_\eta(u)` and
+:math:`a_{K-1} = \sigma_\eta(u - 1)` so that the weights :math:`w_k` sum to one
+and the sample stays inside the support hull.  The Categorical density is
+evaluated exactly as :math:`\sum_k w_k \log p_k` by inverting the sample map.
+The raw grid inverse-CDF transform
+:class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform` and its sample
+:func:`~numpyro.contrib.diag_sgd.smooth_icdf` are kept as primitives.
+
+.. note::
+
+    The end caps are this module's addition, not part of [1].  The paper's
+    smoothing applied literally to the inverse-CDF program is the plain sigmoid
+    sum :math:`\mathrm{low} + \sum_k \sigma_\eta(u - F(k))`
+    (:func:`~numpyro.contrib.diag_sgd.smooth_icdf`), and it was tried as the
+    sample.  It fails for variational inference with an unconstrained discrete
+    guide: each sigmoid leaks about :math:`\eta \log 2` into the mean for
+    every CDF boundary within :math:`\eta` of 1, so as a Bernoulli guide's
+    :math:`q \to 0` the relaxed sample's mean tends to :math:`\eta \log 2`
+    rather than to 0 while the guide density charges :math:`z \log q \to
+    -\infty`.  The smoothed ELBO is then unbounded above in the guide
+    parameter for :math:`\eta` above roughly 0.05, and since
+    :func:`~numpyro.contrib.diag_sgd.eta_schedule` starts far above that, SVI
+    collapses to :math:`q = 0` at once.  The same leak biases wide supports
+    (Binomial(10, 0.3) at :math:`\eta = 0.1` has relaxed mean 3.26 against a
+    true 3.0).  With the end caps the relaxed mean tends to 0 with :math:`q`,
+    the smoothed ELBO tracks the exact one at every :math:`\eta`, and the
+    Binomial mean is 2.99.  Theorem 5.6 of [1] avoids the issue by assuming a
+    compact parameter space, which an unconstrained guide does not satisfy.
+Unbounded families (Poisson, Geometric, GammaPoisson / NegativeBinomial, and
+their zero-inflated wrappers) use
+:class:`~numpyro.contrib.diag_sgd.SmoothedCount`, built on the anchored relaxed
+count :func:`~numpyro.contrib.diag_sgd.anchored_relaxed_count` (and the
+runtime-horizon :func:`~numpyro.contrib.diag_sgd.adaptive_relaxed_count`, which
+accumulates the CDF from the continued log-pmf in a :func:`jax.lax.while_loop`
+and takes distribution-parameter gradients with forward-mode automatic
+differentiation through a custom reverse-mode rule).
 
 Typical usage anneals :math:`\\eta` over training::
 
@@ -393,6 +435,15 @@ eta_schedule
 SmoothedDiscrete
 ----------------
 .. autofunction:: numpyro.contrib.diag_sgd.SmoothedDiscrete
+
+SmoothedFinite
+--------------
+.. autoclass:: numpyro.contrib.diag_sgd.SmoothedFinite
+    :members:
+
+relaxed_finite_index
+--------------------
+.. autofunction:: numpyro.contrib.diag_sgd.relaxed_finite_index
 
 SmoothedCount
 -------------
