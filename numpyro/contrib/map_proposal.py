@@ -9,7 +9,7 @@ from itertools import product
 import math
 from typing import Any, NamedTuple
 
-from jax import jit, lax, random
+from jax import jit, lax, random, tree_util
 import jax.numpy as jnp
 
 import numpyro
@@ -63,10 +63,39 @@ class _MinimizeOptions(NamedTuple):
 
 
 class _OptimizationResult(NamedTuple):
+    """Outcome of one :func:`_minimize` call.
+
+    ``params`` is the **last** iterate. ``best_params`` is the iterate that
+    achieved the lowest single-step loss, ``best_loss``, and ``best_step`` is
+    where that happened. The two differ whenever the trajectory does not end
+    at its own minimum, which a fixed-step-size method is under no obligation
+    to do: Adam's update is ``lr * m / (sqrt(v) + eps)``, so as the gradient
+    decays near an optimum ``v`` decays with it and the normalised step can
+    grow rather than shrink. Observed on a 230,400-coordinate convolutional
+    sparse-coding MAP fit, sampling the loss every 50 steps:
+
+    ==============  ==========  ============================================
+    step            loss        note
+    ==============  ==========  ============================================
+    450             -39904.4    converging, each sample halving its gap
+    600             -40027.1
+    632             -40041.1    the minimum
+    650             -32822.5    **+7,219 nats in one 50-step window**
+    800             -39235.5    never returns to the basin
+    1450            -37963.4
+    ==============  ==========  ============================================
+
+    850 of 1500 steps were spent 806 to 7,219 nats worse than a point already
+    reached, and ``params`` reported the end of that excursion.
+    """
+
     converged: bool
     losses: jnp.ndarray
     num_steps: int
     params: Any
+    best_params: Any = None
+    best_loss: float = math.inf
+    best_step: int = -1
 
 
 class MAPProposalResult(NamedTuple):
@@ -94,18 +123,28 @@ def _minimize(args, initial_parameters, objective, optimizer, options, rng_key):
     optimizer_state = optimizer.init(initial_parameters)
     stalled_checks = 0
     step_keys = random.split(rng_key, options.max_steps)
+    step_indices = jnp.arange(options.max_steps)
+    best = (
+        jnp.asarray(jnp.inf),
+        optimizer.get_params(optimizer_state),
+        jnp.asarray(-1),
+    )
 
     while num_steps < options.max_steps:
         chunk_size = min(
             options.check_interval,
             options.max_steps - num_steps,
         )
-        optimizer_state, losses = _run_optimization_chunk(
+        optimizer_state, losses, best = _run_optimization_chunk(
             args,
             objective,
             optimizer,
             optimizer_state,
-            step_keys[num_steps : num_steps + chunk_size],
+            (
+                step_keys[num_steps : num_steps + chunk_size],
+                step_indices[num_steps : num_steps + chunk_size],
+            ),
+            best,
         )
         loss_chunks.append(losses)
         num_steps += chunk_size
@@ -127,11 +166,15 @@ def _minimize(args, initial_parameters, objective, optimizer, options, rng_key):
             converged = math.isfinite(current_loss)
             break
 
+    best_loss, best_params, best_step = best
     return _OptimizationResult(
         converged=converged,
         losses=jnp.concatenate(loss_chunks),
         num_steps=num_steps,
         params=optimizer.get_params(optimizer_state),
+        best_params=best_params,
+        best_loss=best_loss,
+        best_step=best_step,
     )
 
 
@@ -142,15 +185,43 @@ def _run_optimization_chunk(
     optimizer,
     optimizer_state,
     step_keys,
+    best,
 ):
-    def step(state, key):
+    """Advance ``optimizer_state`` over ``step_keys``, tracking the best iterate.
+
+    ``best`` is ``(loss, params, step)`` carried in and out, so a chunked caller
+    accumulates a per-*step* minimum rather than a per-chunk one. The loss
+    ``eval_and_stable_update`` returns is evaluated at the parameters *before*
+    the update, so the iterate paired with it is ``get_params(state)`` read at
+    the top of the step, not the one the step produces.
+    """
+
+    def step(carry, key_and_index):
+        state, best_loss, best_params, best_step = carry
+        key, index = key_and_index
+
         def loss_fn(parameters):
             return objective(parameters, args, key), None
 
+        parameters = optimizer.get_params(state)
         (loss, _), state = optimizer.eval_and_stable_update(loss_fn, state)
-        return state, loss
+        # A non-finite loss must never win, and `eval_and_stable_update` has
+        # already refused to move on one.
+        improved = jnp.isfinite(loss) & (loss < best_loss)
+        best_loss = jnp.where(improved, loss, best_loss)
+        best_step = jnp.where(improved, index, best_step)
+        best_params = tree_util.tree_map(
+            lambda kept, current: jnp.where(improved, current, kept),
+            best_params,
+            parameters,
+        )
+        return (state, best_loss, best_params, best_step), loss
 
-    return lax.scan(step, optimizer_state, step_keys)
+    best_loss, best_params, best_step = best
+    (optimizer_state, best_loss, best_params, best_step), losses = lax.scan(
+        step, (optimizer_state, best_loss, best_params, best_step), step_keys
+    )
+    return optimizer_state, losses, (best_loss, best_params, best_step)
 
 
 class _ShiftedCategorical(dist.Distribution):
@@ -294,6 +365,7 @@ class AutoMAPProposal(AutoGuide):
         dsgd_kwargs=None,
         init_dispersion=0.1,
         init_loc_fn=init_to_uniform,
+        map_keep_best=False,
         map_max_steps=1000,
         map_optimizer=None,
         map_tolerance=1e-5,
@@ -344,6 +416,7 @@ class AutoMAPProposal(AutoGuide):
         self._map_optimizer = _as_iterative_optimizer(
             Adam(step_size=0.01) if map_optimizer is None else map_optimizer
         )
+        self._map_keep_best = map_keep_best
         self._map_options = _MinimizeOptions(
             check_interval=termination_check_interval,
             max_steps=map_max_steps,
@@ -705,7 +778,15 @@ class AutoMAPProposal(AutoGuide):
                 self._map_options,
                 map_key,
             )
-            map_locs = map_result.params
+            # The MAP objective is deterministic given the latents, so its
+            # per-step minimum is a real point and not a lucky Monte Carlo
+            # draw. The proposal objective is NOT -- it resamples particles
+            # every step -- so `best_params` is deliberately not offered there.
+            map_locs = (
+                map_result.best_params
+                if self._map_keep_best and map_result.best_params is not None
+                else map_result.params
+            )
             proposal_keys = {
                 name: key
                 for name, key in zip(
