@@ -21,6 +21,7 @@ from numpyro.contrib.incremental.density import (
 from numpyro.contrib.incremental.incremental import (
     IncrementalDensity,
     IncrementalState,
+    check_consistency,
 )
 from numpyro.contrib.incremental.interpreter import incrementalize
 
@@ -33,6 +34,7 @@ __all__ = [
     "IncrementalState",
     "SiteMeta",
     "Sliced",
+    "check_consistency",
     "incrementalize",
     "trace_density",
 ]
