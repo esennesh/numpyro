@@ -5,6 +5,8 @@
 
 from collections import namedtuple
 
+import numpy as np
+
 import jax
 from jax.extend.core import Literal
 import jax.numpy as jnp
@@ -180,4 +182,87 @@ class IncrementalDensity:
         return self._compile(change).info["num_eqns"]
 
 
-__all__ = ["IncrementalDensity", "IncrementalState", "Change"]
+# ----------------------------------------------------------------- consistency
+
+
+def random_change(inc, rng, max_block=3, p_sliced=0.7):
+    """
+    A random single-site change for testing: a sliced change along a random non-empty
+    subset of the site's plates (block of at most ``max_block`` indices per axis) with
+    probability ``p_sliced`` when the site is plated, else a dense change.
+    """
+    sites = list(inc.sites)
+    name = sites[rng.randint(len(sites))]
+    meta = inc.sites[name]
+    k = meta.support_size or 5
+
+    def draw(shape):
+        if meta.is_discrete:
+            return np.asarray(rng.randint(k, size=shape), dtype=np.int32)
+        return np.asarray(rng.standard_normal(shape), dtype=np.float32)
+
+    if meta.plates and rng.rand() < p_sliced:
+        plates = [p for p, _ in meta.plates if rng.rand() < 0.7] or [meta.plates[0][0]]
+        axes = dict(meta.plates)
+        index, shape = {}, list(meta.shape)
+        for p in plates:
+            size = meta.shape[axes[p]]
+            kk = rng.randint(1, min(size, max_block) + 1)
+            index[p] = rng.choice(size, size=kk, replace=False).astype(np.int32)
+            shape[axes[p]] = kk
+        return Change.sliced({name: draw(tuple(shape))}, index)
+    return Change.dense({name: draw(meta.shape)})
+
+
+def check_consistency(
+    inc,
+    model_args=(),
+    model_kwargs=None,
+    *,
+    num_changes=20,
+    seed=0,
+    rtol=1e-4,
+    atol=1e-4,
+    reject_every=3,
+):
+    """
+    Apply ``num_changes`` random changes (rejecting every ``reject_every``-th one, i.e.
+    reusing the old state) and compare every cached factor and the running total with
+    from-scratch evaluation after each step. Raises ``AssertionError`` on a mismatch
+    and returns the largest absolute error seen.
+    """
+    rng = np.random.RandomState(seed)
+    state = inc.init(model_args=model_args, model_kwargs=model_kwargs)
+    worst = 0.0
+    for step in range(num_changes):
+        change = random_change(inc, rng)
+        delta, new_state = inc.apply(state, change, model_args, model_kwargs)
+        fresh = inc.program.eval(new_state.z, model_args, model_kwargs)
+        cached = inc.factor_values(new_state)
+        for name in inc.program.factor_names:
+            err = np.max(np.abs(np.asarray(cached[name]) - np.asarray(fresh[name])))
+            worst = max(worst, float(err))
+            np.testing.assert_allclose(
+                cached[name],
+                fresh[name],
+                rtol=rtol,
+                atol=atol,
+                err_msg=f"{change} {name}",
+            )
+        expected = sum(float(jnp.sum(v)) for v in fresh.values())
+        np.testing.assert_allclose(
+            new_state.total, expected, rtol=rtol, atol=atol, err_msg=f"{change} total"
+        )
+        if reject_every and step % reject_every == reject_every - 1:
+            continue
+        state = new_state
+    return worst
+
+
+__all__ = [
+    "IncrementalDensity",
+    "IncrementalState",
+    "Change",
+    "check_consistency",
+    "random_change",
+]

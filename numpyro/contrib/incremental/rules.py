@@ -10,11 +10,20 @@ equation on the materialized inputs. The default rule materializes every input a
 rebinds the primitive, so unknown primitives are always handled soundly (as ``Dense``).
 """
 
+import jax
 from jax import lax
 from jax.extend.core import Literal, primitives as P
 import jax.numpy as jnp
+import jax.scipy.special
 
-from numpyro.contrib.incremental.delta import SAME, Dense, Same, Sliced, sliced_shape
+from numpyro.contrib.incremental.delta import (
+    SAME,
+    Dense,
+    Same,
+    Sliced,
+    gather_rect,
+    sliced_shape,
+)
 
 RULES = {}
 
@@ -201,6 +210,38 @@ def reduce_rule(ctx, eqn, in_deltas):
 
 OVERLAP_REDUCE_RULES = {}
 
+
+def reduce_sum_overlap_rule(ctx, eqn, in_deltas):
+    """
+    The paper's incremental accumulator: a sum over a sliced axis is updated as
+    ``old_sum - sum(old_slice) + sum(new_slice)``. Axes that are sliced but not reduced
+    stay sliced. The result is guarded: if the formula is not finite (e.g. an ``-inf``
+    in the cached sum) the reduction is recomputed from the materialized input, so a
+    non-finite value can never poison the cache.
+    """
+    (d,) = in_deltas
+    atom = eqn.invars[0]
+    red = tuple(eqn.params["axes"])
+    keep = [(a, i) for a, i in zip(d.axes, d.idxs) if a not in red]
+    out_axes = tuple(a - sum(1 for r in red if r < a) for a, _ in keep)
+    out_idxs = tuple(i for _, i in keep)
+    old_out = ctx.slice(eqn.outvars[0], out_axes, out_idxs)
+    old_slice = ctx.slice(atom, d.axes, d.idxs)
+    formula = old_out + bind(eqn, d.value)[0] - bind(eqn, old_slice)[0]
+
+    def recompute():
+        full = bind(eqn, ctx.materialize_sliced(atom, d))[0]
+        return full if not out_axes else gather_rect(full, out_axes, out_idxs)
+
+    out = lax.cond(jnp.all(jnp.isfinite(formula)), lambda: formula, recompute)
+    if out_axes:
+        token = (d.token, "reduce", red)
+        return [Sliced(out_axes, out_idxs, out, token)]
+    return [Dense(out)]
+
+
+OVERLAP_REDUCE_RULES[P.reduce_sum_p] = reduce_sum_overlap_rule
+
 for _name in (
     "reduce_sum",
     "reduce_max",
@@ -269,10 +310,60 @@ RULES[P.jit_p] = _call_rule("jaxpr")
 RULES[P.closed_call_p] = _call_rule("call_jaxpr")
 
 
+# Public elementwise functions behind common ``custom_jvp_call`` equations, keyed by
+# the traced function's name. On the sliced path they are re-called on the slices so
+# that ``jax.grad`` through the emitted program still sees the custom JVP rule.
+CUSTOM_JVP_REGISTRY = {
+    "xlogy": jax.scipy.special.xlogy,
+    "xlog1py": jax.scipy.special.xlog1py,
+    "logaddexp": jnp.logaddexp,
+    "logaddexp2": jnp.logaddexp2,
+}
+
+
+def _broadcast_elementwise(ctx, eqn, in_deltas, fn):
+    """Apply an elementwise ``fn`` on slices, honouring size-1 broadcast dims."""
+    sliced = [d for d in in_deltas if isinstance(d, Sliced)]
+    ref = sliced[0]
+    out_shape = eqn.outvars[0].aval.shape
+    for d in sliced[1:]:
+        if not d.same_block(ref):
+            return None
+    args = []
+    for atom, d in zip(eqn.invars, in_deltas):
+        shape = atom.aval.shape
+        if isinstance(d, Sliced):
+            if len(shape) != len(out_shape):
+                return None
+            args.append(d.value)
+        elif len(shape) == 0:
+            args.append(ctx.full(atom))
+        elif len(shape) != len(out_shape):
+            return None
+        else:
+            axes = [(a, i) for a, i in zip(ref.axes, ref.idxs) if shape[a] != 1]
+            args.append(
+                ctx.slice(atom, tuple(a for a, _ in axes), tuple(i for _, i in axes))
+            )
+    out = fn(*args)
+    return [Sliced(ref.axes, ref.idxs, out, ref.token)]
+
+
 def custom_jvp_rule(ctx, eqn, in_deltas):
-    # Dense/Same path: rebind whole so autodiff keeps the custom rule. The sliced path
-    # is refined in a later step; for now it materializes.
-    return default_rule(ctx, eqn, in_deltas)
+    # Dense path: rebind whole so autodiff keeps the custom rule.
+    if any(isinstance(d, Dense) for d in in_deltas):
+        return default_rule(ctx, eqn, in_deltas)
+    closed = eqn.params["call_jaxpr"]
+    name = getattr(getattr(closed.jaxpr, "debug_info", None), "func_name", None)
+    fn = CUSTOM_JVP_REGISTRY.get(name)
+    if fn is not None:
+        out = _broadcast_elementwise(ctx, eqn, in_deltas, fn)
+        if out is not None:
+            return out
+    # Sliced path for an unknown function: interpret the primal body with the Δ-rules
+    # (shape-specialised inner equations cannot be rebound on slices). Gradients
+    # through this path differentiate the primal rather than the custom rule.
+    return ctx.interpret(closed.jaxpr, closed.consts, in_deltas)
 
 
 RULES[P.custom_jvp_call_p] = custom_jvp_rule

@@ -98,9 +98,11 @@ slices once.
    N = 100, 1 000 and 10 000). Discovered: a value crossing a call boundary must have
    one cache id, or a skipped call reads a stale outer copy; `number_vars` aliases
    statically.
-3. ⏳ `reduce_sum` delta rule, dense propagation, reparam, finiteness guard, resync;
-   gradient equality on the dense path.
-4. ⏳ `custom_jvp` registry/recursion.
+3. ✅ `reduce_sum` delta rule (sliced axes that are not reduced stay sliced; a
+   non-finite result falls back to recomputation under `lax.cond`, which becomes a
+   `select` under `vmap`), `check_consistency`, gradient equality on the dense path.
+4. ✅ `custom_jvp`: registry (`xlogy`, `xlog1py`, `logaddexp`) re-called on slices,
+   recursion into the primal body otherwise, whole rebinding on the dense path.
 5. ⏳ Slice pullback and `cache="plan"`.
 6. ⏳ `adapt.py` and `sa.py` fix; posterior agreement with `DiscreteHMCGibbs`.
 7. ⏳ Docs (`contrib.rst`), `examples/incremental_gmm.py`, benchmark table here.

@@ -111,8 +111,12 @@ EXPECTED_TAGS = {
     ("gmm", "w"): {"w": "Dense", "_w_log_det": "Dense", "z": "Dense", "obs": "Same"},
     ("nested", "b"): {"b": "Sliced", "obs": "Sliced", "a": "Same"},
     ("reparam", "s"): {"s": "Sliced", "_s_log_det": "Sliced", "obs": "Sliced"},
-    # Bernoulli.log_prob goes through custom_jvp (xlogy): sliced support is step 4.
-    ("determ", "z"): {"obs": "Sliced", "mu": "Same"},
+    # Bernoulli.log_prob goes through custom_jvp (xlogy) on the sliced path.
+    ("determ", "z"): {"obs": "Sliced", "z": "Sliced", "mu": "Same"},
+    ("discrete", "k"): {"k": "Sliced", "obs": "Sliced", "b": "Same", "p": "Same"},
+    ("discrete", "b"): {"b": "Sliced", "obs": "Sliced", "k": "Same"},
+    # x.sum() feeds tot: the reduce_sum delta rule keeps it O(1) but Dense.
+    ("reduction", "x"): {"x": "Sliced", "obs": "Sliced", "tot": "Dense"},
     ("prebatched", "z"): {"obs": "Sliced", "z": "Sliced", "mu": "Same"},
     ("subsampled", "z"): {"obs": "Sliced", "z": "Sliced", "mu": "Same"},
     ("scaled", "mu"): {"obs": "Dense", "pen": "Dense", "mu": "Dense"},
