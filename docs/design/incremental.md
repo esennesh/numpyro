@@ -91,9 +91,13 @@ slices once.
 
 ## Steps and progress
 
-1. ⏳ Design doc, package skeleton, `density.py`, model zoo, `test_density.py`.
-2. ⏳ `delta.py`, `rules.py` (elementwise, shape ops, `iota`, `gather`, call recursion,
-   default materialise), `interpreter.py` with `cache="all"`; cost-constancy test.
+1. ✅ Design doc, package skeleton, `density.py`, model zoo, `test_density.py`.
+2. ✅ `delta.py`, `rules.py` (elementwise, shape ops, `iota`, `gather`, call recursion,
+   default materialise), `interpreter.py` with `cache="all"`; cost-constancy test
+   (2026-10-22: one GMM assignment update compiles to the same flop count at
+   N = 100, 1 000 and 10 000). Discovered: a value crossing a call boundary must have
+   one cache id, or a skipped call reads a stale outer copy; `number_vars` aliases
+   statically.
 3. ⏳ `reduce_sum` delta rule, dense propagation, reparam, finiteness guard, resync;
    gradient equality on the dense path.
 4. ⏳ `custom_jvp` registry/recursion.

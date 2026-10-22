@@ -11,16 +11,28 @@ al., *Incremental Computation for Efficient Programmable Inference in Probabilis
 Programs* (PLDI 2026, doi:10.1145/3808316).
 """
 
+from numpyro.contrib.incremental.delta import Change, Dense, Sliced
 from numpyro.contrib.incremental.density import (
     DensityProgram,
     FactorMeta,
     SiteMeta,
     trace_density,
 )
+from numpyro.contrib.incremental.incremental import (
+    IncrementalDensity,
+    IncrementalState,
+)
+from numpyro.contrib.incremental.interpreter import incrementalize
 
 __all__ = [
+    "Change",
+    "Dense",
     "DensityProgram",
     "FactorMeta",
+    "IncrementalDensity",
+    "IncrementalState",
     "SiteMeta",
+    "Sliced",
+    "incrementalize",
     "trace_density",
 ]
