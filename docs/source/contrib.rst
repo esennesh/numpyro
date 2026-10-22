@@ -123,7 +123,7 @@ described in [`1 <hsgp-ref-1_>`__] and [`2 <hsgp-ref-2_>`__].
 .. warning::
     This module is experimental.
 
-**Why do we need an approximation?** 
+**Why do we need an approximation?**
 
 Gaussian processes do not scale well with the number of data points. Recall we had to invert the kernel matrix!
 The computational complexity of the Gaussian process model is :math:`\mathcal{O}(n^3)`, where :math:`n` is the number of data
@@ -151,8 +151,8 @@ Let :math:`m^\star = \prod_{d=1}^D m_d` be the total number of terms of the appr
 
 .. math::
 
-    f(x) \approx \sum_{j = 1}^{m^\star} 
-    \overbrace{\color{red}{\left(S(\sqrt{\boldsymbol{\lambda}_j})\right)^{1/2}}}^{\text{all hyperparameters are here!}} 
+    f(x) \approx \sum_{j = 1}^{m^\star}
+    \overbrace{\color{red}{\left(S(\sqrt{\boldsymbol{\lambda}_j})\right)^{1/2}}}^{\text{all hyperparameters are here!}}
     \times
     \underbrace{\color{blue}{\phi_{j}(\boldsymbol{x})}}_{\text{easy to compute!}}
     \times
@@ -343,3 +343,73 @@ hsgp_rational_quadratic
 hsgp_periodic_non_centered
 --------------------------
 .. autofunction:: numpyro.contrib.hsgp.approximation.hsgp_periodic_non_centered
+
+
+Incremental density computation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``numpyro.contrib.incremental`` compiles a model to a deterministic *density program*
+(a jaxpr whose inputs are the latent site values and whose outputs are the per-factor
+unsummed log densities) and incrementalizes that program against typed *change
+descriptions*, following [1]. A :class:`~numpyro.contrib.incremental.Change` replaces
+whole sites (``Change.dense``) or a rectangular block of plate elements
+(``Change.sliced``); applying it re-executes only the equations the change reaches,
+reading unchanged intermediate values from a cache, so that updating one element of a
+plated site costs its Markov blanket rather than the whole model. The emitted program
+is an ordinary JAX function and composes with ``jit``, ``vmap`` and ``grad``.
+
+:class:`~numpyro.contrib.incremental.IncrementalMCMC` runs existing kernels as block
+steps on the incremental density: ``HMC``/``NUTS``/``SA`` on continuous blocks (their
+gradient flows only through the factors the block touches) and
+:class:`~numpyro.contrib.incremental.DiscreteGibbs`, which drives the proposal
+functions of :class:`~numpyro.infer.hmc_gibbs.DiscreteHMCGibbs` one plate element at a
+time. ``IncrementalMCMC.from_kernel`` adapts a ``DiscreteHMCGibbs``, ``HMCGibbs``,
+``HMC``, ``NUTS`` or ``SA`` instance directly::
+
+    kernel = IncrementalMCMC.from_kernel(DiscreteHMCGibbs(NUTS(model)))
+    mcmc = MCMC(kernel, num_warmup=500, num_samples=1000)
+    mcmc.run(random.key(0), data)
+
+Limitations: sites marked for parallel enumeration, subsampled plates and latent
+``Delta`` sites are rejected; ``scan``/``cond``/``while`` and unknown primitives fall
+back to dense recomputation (still exact); shapes are static, so open-universe moves
+(births/deaths) must be expressed on fixed-capacity arrays.
+
+**References:**
+
+1. *Incremental Computation for Efficient Programmable Inference in Probabilistic
+   Programs*, Fabian Zaiser et al., PACMPL 10 (PLDI), 2026.
+   https://doi.org/10.1145/3808316
+
+IncrementalDensity
+------------------
+.. autoclass:: numpyro.contrib.incremental.IncrementalDensity
+    :members:
+    :member-order: bysource
+
+Change
+------
+.. autoclass:: numpyro.contrib.incremental.Change
+    :members: dense, sliced, signature
+
+IncrementalMCMC
+---------------
+.. autoclass:: numpyro.contrib.incremental.IncrementalMCMC
+    :members: from_kernel
+    :show-inheritance:
+
+DiscreteGibbs
+-------------
+.. autoclass:: numpyro.contrib.incremental.DiscreteGibbs
+
+GibbsFn
+-------
+.. autoclass:: numpyro.contrib.incremental.GibbsFn
+
+trace_density
+-------------
+.. autofunction:: numpyro.contrib.incremental.trace_density
+
+check_consistency
+-----------------
+.. autofunction:: numpyro.contrib.incremental.check_consistency

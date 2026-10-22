@@ -12,9 +12,10 @@ block of sites with an existing kernel:
   :class:`~numpyro.infer.sa.SA` instances are rebound to a potential
   ``-(total + delta)`` whose gradient flows only through the factors the block
   touches (Δ-propagation makes exactly those dense);
-- :class:`DiscreteGibbs` drives the proposal functions of
-  :class:`~numpyro.infer.hmc_gibbs.DiscreteHMCGibbs` with a *sliced* incremental
-  potential, so a single-element update costs its Markov blanket, not the model;
+- :class:`DiscreteGibbs` performs the single-site updates of
+  :class:`~numpyro.infer.hmc_gibbs.DiscreteHMCGibbs` (Gibbs, modified Gibbs and their
+  random-walk variants) with a *sliced* incremental potential, so a single-element
+  update costs its Markov blanket, not the model;
 - :class:`GibbsFn` wraps a user ``gibbs_fn`` as in :class:`~numpyro.infer.hmc_gibbs.HMCGibbs`.
 
 :meth:`IncrementalMCMC.from_kernel` adapts a ``DiscreteHMCGibbs``, ``HMCGibbs``, ``HMC``,
@@ -29,20 +30,13 @@ import math
 import jax
 from jax import lax, random, vmap
 import jax.numpy as jnp
+from jax.scipy.special import logsumexp
 
 from numpyro.contrib.incremental.delta import Change
 from numpyro.contrib.incremental.incremental import IncrementalDensity
 from numpyro.handlers import seed, substitute, trace
 from numpyro.infer.hmc import HMC, hmc
-from numpyro.infer.hmc_gibbs import (
-    DiscreteHMCGibbs,
-    HMCGibbs,
-    _discrete_gibbs_proposal,
-    _discrete_modified_gibbs_proposal,
-    _discrete_modified_rw_proposal,
-    _discrete_rw_proposal,
-    _wrap_model,
-)
+from numpyro.infer.hmc_gibbs import DiscreteHMCGibbs, HMCGibbs, _wrap_model
 from numpyro.infer.initialization import init_to_sample
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.sa import SA, _sa
@@ -176,14 +170,19 @@ class PotentialBlock(Block):
 
 class DiscreteGibbs(Block):
     """
-    Single-site Gibbs (or Metropolised Gibbs / random-walk) updates of discrete sites
-    with enumerable support, one plate element at a time, using the proposal
-    functions of :class:`~numpyro.infer.hmc_gibbs.DiscreteHMCGibbs` driven by the
-    incremental potential.
+    Single-site updates of discrete sites with enumerable support, one plate element
+    at a time, with the proposals of :class:`~numpyro.infer.hmc_gibbs.DiscreteHMCGibbs`:
+    Gibbs (sample the exact conditional), modified Gibbs (the current value excluded,
+    with its Metropolis correction) and their random-walk variants.
+
+    For each element the log density change of every candidate value is computed with
+    one ``vmap``-ped incremental evaluation (cost: the element's Markov blanket times
+    the support size); the new value is then written back with one sliced apply, so a
+    sweep never materializes anything of the size of the data.
 
     :param bool random_walk: propose uniformly instead of from the conditional.
-    :param bool modified: use the modified (current value excluded) proposals with
-        their Metropolis correction.
+    :param bool modified: exclude the current value from the proposal and apply the
+        Metropolis correction of ``DiscreteHMCGibbs(modified=True)``.
     :param str order: ``"random"`` (a fresh permutation per sweep) or ``"systematic"``.
     """
 
@@ -193,18 +192,6 @@ class DiscreteGibbs(Block):
         self.random_walk = random_walk
         self.modified = modified
         self.order = order
-        if random_walk:
-            self.proposal_fn = (
-                partial(_discrete_modified_rw_proposal, stay_prob=0.0)
-                if modified
-                else _discrete_rw_proposal
-            )
-        else:
-            self.proposal_fn = (
-                partial(_discrete_modified_gibbs_proposal, stay_prob=0.0)
-                if modified
-                else _discrete_gibbs_proposal
-            )
 
     def bind(self, inc, sites):
         for s in sites:
@@ -227,32 +214,58 @@ class DiscreteGibbs(Block):
         shape = tuple(meta.shape[a] for a in axes)
         return names, axes, shape
 
+    def _change_for(self, meta, site, value, e):
+        """The change setting element ``e`` of ``site`` to the scalar ``value``."""
+        names, axes, plate_shape = self._plate_info(meta)
+        value = jnp.asarray(value, meta.dtype)
+        if not names:
+            return Change.dense({site: jnp.reshape(value, meta.shape)})
+        multi = jnp.unravel_index(e, plate_shape)
+        value = jnp.reshape(value, [1] * len(axes))
+        return Change.sliced({site: value}, dict(zip(names, multi)))
+
     def plan(self, inc):
-        changes = []
-        for s in self.sites:
-            meta = inc.sites[s]
-            names, axes, shape = self._plate_info(meta)
-            if names:
-                value = jnp.zeros([1] * len(axes), meta.dtype)
-                changes.append(Change.sliced({s: value}, {p: 0 for p in names}))
+        return [
+            self._change_for(inc.sites[s], s, 0, jnp.zeros((), int)) for s in self.sites
+        ]
+
+    def _propose(self, rng_key, deltas, cur, support_size):
+        """
+        Given ``deltas[c] = log p(c | rest) - log p(cur | rest)`` for every candidate,
+        draw a proposal and its log acceptance ratio (the proposal maths of
+        ``numpyro.infer.hmc_gibbs``).
+        """
+        candidates = jnp.arange(support_size)
+        rng_prop, rng_accept = random.split(rng_key)
+        if self.random_walk:
+            if self.modified:
+                i = random.randint(rng_prop, (), 0, support_size - 1)
+                prop = jnp.where(i >= cur, i + 1, i)
             else:
-                changes.append(Change.dense({s: jnp.zeros(meta.shape, meta.dtype)}))
-        return changes
+                prop = random.randint(rng_prop, (), 0, support_size)
+            log_accept = deltas[prop]
+        elif self.modified:
+            logits = jnp.where(candidates == cur, -jnp.inf, deltas)
+            prop = random.categorical(rng_prop, logits)
+            log_weight_sum = logsumexp(logits)
+            # MH correction (1 - P(cur)) / (1 - P(prop)); see
+            # hmc_gibbs._discrete_modified_gibbs_proposal.
+            log_accept = log_weight_sum - jnp.log(
+                jnp.exp(log_weight_sum) - jnp.expm1(deltas[prop])
+            )
+        else:
+            prop = random.categorical(rng_prop, deltas)
+            log_accept = jnp.zeros(())
+        accept = random.exponential(rng_accept) > -log_accept
+        return jnp.where(accept, prop, cur)
 
     def sample(self, inc, state, block_state, rng_key, model_args, model_kwargs):
         for site in self.sites:
             meta = inc.sites[site]
-            names, axes, plate_shape = self._plate_info(meta)
+            names, _, plate_shape = self._plate_info(meta)
             n = int(math.prod(plate_shape)) if names else 1
             support_size = meta.support_size
-
-            def change_for(value, e, names=names, axes=axes, shape=plate_shape):
-                if not names:
-                    return Change.dense({site: value})
-                multi = jnp.unravel_index(e, shape)
-                for a, m in zip(axes, multi):
-                    value = lax.dynamic_index_in_dim(value, m, axis=a, keepdims=True)
-                return Change.sliced({site: value}, dict(zip(names, multi)))
+            candidates = jnp.arange(support_size)
 
             rng_key, rng_order = random.split(rng_key)
             if self.order == "random":
@@ -260,33 +273,21 @@ class DiscreteGibbs(Block):
             else:
                 order = jnp.arange(n)
 
-            def body(j, carry, site=site, change_for=change_for):
+            def body(j, carry, site=site, meta=meta):
                 rng_key, state = carry
                 e = order[j]
+                cur = jnp.reshape(state.z[site], (-1,))[e]
 
-                def potential_fn(z_new):
-                    delta, _ = inc.apply_delta(
-                        state, change_for(z_new[site], e), model_args, model_kwargs
-                    )
-                    return -(state.total + delta)
+                def delta_of(c):
+                    change = self._change_for(meta, site, c, e)
+                    return inc.apply_delta(state, change, model_args, model_kwargs)[0]
 
-                rng_key, z_new, _, log_accept_ratio = self.proposal_fn(
-                    rng_key,
-                    {site: state.z[site]},
-                    -state.total,
-                    potential_fn=potential_fn,
-                    idx=e,
-                    support_size=support_size,
-                )
-                rng_key, rng_accept = random.split(rng_key)
-                accept = random.exponential(rng_accept) > -log_accept_ratio
-
-                def do_accept(s):
-                    return inc.apply(
-                        s, change_for(z_new[site], e), model_args, model_kwargs
-                    )[1]
-
-                state = lax.cond(accept, do_accept, identity, state)
+                deltas = vmap(delta_of)(candidates)
+                deltas = jnp.where(jnp.isfinite(deltas), deltas, -jnp.inf)
+                rng_key, rng_prop = random.split(rng_key)
+                new = self._propose(rng_prop, deltas, cur, support_size)
+                change = self._change_for(meta, site, new, e)
+                _, state = inc.apply(state, change, model_args, model_kwargs)
                 return rng_key, state
 
             rng_key, state = lax.fori_loop(0, n, body, (rng_key, state))
@@ -339,8 +340,8 @@ class IncrementalMCMC(MCMCKernel):
 
     :param model: a NumPyro model.
     :param steps: a list of ``(sites, kernel)`` pairs applied in order every
-        iteration. ``sites`` is a site name, a sequence of names, ``None`` (the step's
-        default: all discrete sites for :class:`DiscreteGibbs`, every site not
+        iteration. ``sites`` is a site name, a sequence of names, or ``None`` (the
+        step's default: all discrete sites for :class:`DiscreteGibbs`, every site not
         claimed by another step otherwise). ``kernel`` is an ``HMC``/``NUTS``/``SA``
         instance (its model, if any, is ignored), a :class:`DiscreteGibbs`, a
         :class:`GibbsFn`, or any :class:`Block`.
@@ -380,8 +381,7 @@ class IncrementalMCMC(MCMCKernel):
         self._inc = None
         self._blocks = None
         self._sample_fn = None
-        self._model_args = ()
-        self._model_kwargs = {}
+        self._num_warmup = None
 
     @staticmethod
     def _as_block(sites, kernel):
@@ -477,8 +477,6 @@ class IncrementalMCMC(MCMCKernel):
         return resolved
 
     def _setup(self, model_args, model_kwargs):
-        self._model_args = model_args
-        self._model_kwargs = model_kwargs
         self._inc = IncrementalDensity(
             self._model,
             model_args,

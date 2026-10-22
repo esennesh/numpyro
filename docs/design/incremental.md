@@ -114,7 +114,23 @@ slices once.
    tolerances of `test_discrete_gibbs_gmm_1d`; plated GMM agrees with
    `DiscreteHMCGibbs`; exact conjugate posterior for a `gibbs_fn` block; vectorized
    chains; total in sync with from-scratch evaluation after a run with `resync_every`.
-7. ⏳ Docs (`contrib.rst`), `examples/incremental_gmm.py`, benchmark table here.
+7. ✅ Docs (`contrib.rst`), `examples/incremental_gmm.py`, benchmark below.
+
+## Benchmark (2026-10-22, CPU, `examples/incremental_gmm.py`, K = 3)
+
+`DiscreteHMCGibbs(NUTS(model))` as is versus the same kernel through
+`IncrementalMCMC.from_kernel`; wall time of a compiled run of 300 steps (100 warmup):
+
+| N | DiscreteHMCGibbs | incremental |
+|---|---|---|
+| 400 | 0.79 s | 0.96 s |
+| 2 000 | 4.14 s | 2.86 s |
+
+One assignment update compiles to 23 flops with 18 of 124 equations re-executed at
+N = 400, 2 000, 4 000 and 20 000. The per-sweep cost of the discrete block is linear in
+N for the incremental kernel and quadratic for the reference; the NUTS block is linear
+in both, so the crossover sits around N ≈ 1 000 on CPU and the gap widens from there.
+Constant factors dominate at small N, as the paper also reports for Gen.
 
 Later: `scan` rule for Markov structure; data-dependent `gather` sparsity (the paper's
 `using`); `memo` primitive for latent-independent intermediates; masked fixed-capacity
@@ -130,3 +146,10 @@ data growth (SMC-style); `MixedHMC`; `BarkerMH`.
   kernel library.
 - 2026-10-22: Model args are jaxpr invars, not closed-over constants; validation off by
   default when tracing the density.
+- 2026-10-22: `DiscreteGibbs` reproduces the proposal maths of `hmc_gibbs` instead of
+  calling its functions: they carry the full site array through the candidate loop
+  (`z_flat.at[idx].set` per candidate) and would make every element update O(N).
+  Candidate deltas are `vmap`-ped over scalar values and the chosen value is written
+  back with one sliced apply, with no `lax.cond` on the state.
+- 2026-10-22: `test/infer/test_mcmc.py::test_beta_bernoulli_x64[SA]` fails on
+  `develop` before the `sa.py` one-liner as well; not caused by this branch.
