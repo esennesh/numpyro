@@ -108,7 +108,12 @@ slices once.
    the same function, so variables are keyed by `(call path, var)`; and a cut point
    inside a body that is rebound whole on the dense path must be refreshed
    (`Context.refresh_body`), or it goes stale.
-6. ⏳ `adapt.py` and `sa.py` fix; posterior agreement with `DiscreteHMCGibbs`.
+6. ✅ `adapt.py` (`IncrementalMCMC`, `PotentialBlock` for HMC/NUTS/SA, `DiscreteGibbs`
+   reusing the `hmc_gibbs` proposal functions, `GibbsFn`, `from_kernel`) and the
+   `sa.py` one-liner. Posterior checks: 1-D mixture analytic moments at the
+   tolerances of `test_discrete_gibbs_gmm_1d`; plated GMM agrees with
+   `DiscreteHMCGibbs`; exact conjugate posterior for a `gibbs_fn` block; vectorized
+   chains; total in sync with from-scratch evaluation after a run with `resync_every`.
 7. ⏳ Docs (`contrib.rst`), `examples/incremental_gmm.py`, benchmark table here.
 
 Later: `scan` rule for Markov structure; data-dependent `gather` sparsity (the paper's
