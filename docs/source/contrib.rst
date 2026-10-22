@@ -123,7 +123,7 @@ described in [`1 <hsgp-ref-1_>`__] and [`2 <hsgp-ref-2_>`__].
 .. warning::
     This module is experimental.
 
-**Why do we need an approximation?** 
+**Why do we need an approximation?**
 
 Gaussian processes do not scale well with the number of data points. Recall we had to invert the kernel matrix!
 The computational complexity of the Gaussian process model is :math:`\mathcal{O}(n^3)`, where :math:`n` is the number of data
@@ -151,8 +151,8 @@ Let :math:`m^\star = \prod_{d=1}^D m_d` be the total number of terms of the appr
 
 .. math::
 
-    f(x) \approx \sum_{j = 1}^{m^\star} 
-    \overbrace{\color{red}{\left(S(\sqrt{\boldsymbol{\lambda}_j})\right)^{1/2}}}^{\text{all hyperparameters are here!}} 
+    f(x) \approx \sum_{j = 1}^{m^\star}
+    \overbrace{\color{red}{\left(S(\sqrt{\boldsymbol{\lambda}_j})\right)^{1/2}}}^{\text{all hyperparameters are here!}}
     \times
     \underbrace{\color{blue}{\phi_{j}(\boldsymbol{x})}}_{\text{easy to compute!}}
     \times
@@ -343,3 +343,265 @@ hsgp_rational_quadratic
 hsgp_periodic_non_centered
 --------------------------
 .. autofunction:: numpyro.contrib.hsgp.approximation.hsgp_periodic_non_centered
+
+
+Diagonalisation SGD
+~~~~~~~~~~~~~~~~~~~
+
+``numpyro.contrib.diag_sgd`` implements Diagonalisation SGD (DSGD) [1], a program
+transformation that makes models with discrete latent variables amenable to
+reparameterisation-gradient optimisation. Each discrete sample site is replaced
+by a smooth inverse-CDF reparameterisation controlled by a temperature
+:math:`\eta`; as :math:`\eta \to 0` the smoothed objective converges to the
+original one, and [1] (Theorem 5.6) gives an :math:`\eta`-schedule under which the
+DSGD gradient estimator converges almost surely to stationary points.
+
+Finite-support families use the grid inverse-CDF
+:class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform`. Unbounded families
+(Poisson, Geometric, GammaCount, GammaPoisson / NegativeBinomial, and their
+zero-inflated wrappers) instead use the adaptive index-space relaxed count
+:func:`~numpyro.contrib.diag_sgd.adaptive_relaxed_count`. Writing
+:math:`a_k = \sigma_\eta(u - F(k))` and
+:math:`w_k = a_{k-1} - a_k`, it returns the convex combination
+
+.. math::
+
+    Q_\eta(u) = \frac{\sum_{k} k w_k}{\sum_{k} w_k},
+
+and the density term of the smoothed objective is the *analytic continuation of
+the discrete log-pmf* evaluated at :math:`Q_\eta(u)` -- for a Bernoulli
+:math:`z \log p + (1 - z) \log(1 - p)`, for a Poisson
+:math:`z \log \lambda - \lambda - \log\Gamma(z + 1)`, for a Categorical the
+linear interpolation of :math:`\log p_k` between neighbouring categories.
+The change-of-variables pushforward density of the smooth inverse-CDF is *not*
+used: for a Bernoulli it does not depend on :math:`p` at all, so
+:math:`\log p - \log q` would vanish identically, and for unbounded families it
+diverges for near-deterministic distributions. The continued log-pmf is bounded,
+exact on the integers, and makes :math:`\mathbb{E}_q[\log p - \log q]` a
+:math:`-\mathrm{KL}` surrogate that is exact when the soft one-hot weights of
+the relaxed sample have the right expectations (:math:`\mathbb{E}_q[w_k] = q_k`;
+for a Bernoulli, :math:`\mathbb{E}_q[z] = q`) and otherwise off by a mean bias
+that vanishes as :math:`\eta \to 0`.
+
+Finite-support families (Bernoulli, Categorical, Binomial, DiscreteUniform) use
+:class:`~numpyro.contrib.diag_sgd.SmoothedFinite`, whose sample is the
+normalised relaxation :func:`~numpyro.contrib.diag_sgd.relaxed_finite_index`
+over the CDF grid, with end caps :math:`a_{-1} = \sigma_\eta(u)` and
+:math:`a_{K-1} = \sigma_\eta(u - 1)` so that the weights :math:`w_k` sum to one
+and the sample stays inside the support hull.  The Categorical density is
+evaluated exactly as :math:`\sum_k w_k \log p_k` by inverting the sample map.
+The raw grid inverse-CDF transform
+:class:`~numpyro.contrib.diag_sgd.SmoothICDFTransform` and its sample
+:func:`~numpyro.contrib.diag_sgd.smooth_icdf` are kept as primitives.
+
+.. note::
+
+    The end caps are this module's addition, not part of [1].  The paper's
+    smoothing applied literally to the inverse-CDF program is the plain sigmoid
+    sum :math:`\mathrm{low} + \sum_k \sigma_\eta(u - F(k))`
+    (:func:`~numpyro.contrib.diag_sgd.smooth_icdf`), and it was tried as the
+    sample.  It fails for variational inference with an unconstrained discrete
+    guide: each sigmoid leaks about :math:`\eta \log 2` into the mean for
+    every CDF boundary within :math:`\eta` of 1, so as a Bernoulli guide's
+    :math:`q \to 0` the relaxed sample's mean tends to :math:`\eta \log 2`
+    rather than to 0 while the guide density charges :math:`z \log q \to
+    -\infty`.  The smoothed ELBO is then unbounded above in the guide
+    parameter for :math:`\eta` above roughly 0.05, and since
+    :func:`~numpyro.contrib.diag_sgd.eta_schedule` starts far above that, SVI
+    collapses to :math:`q = 0` at once.  The same leak biases wide supports
+    (Binomial(10, 0.3) at :math:`\eta = 0.1` has relaxed mean 3.26 against a
+    true 3.0).  With the end caps the relaxed mean tends to 0 with :math:`q`,
+    the smoothed ELBO tracks the exact one at every :math:`\eta`, and the
+    Binomial mean is 2.99.  Theorem 5.6 of [1] avoids the issue by assuming a
+    compact parameter space, which an unconstrained guide does not satisfy.
+Unbounded families (Poisson, Geometric, GammaPoisson / NegativeBinomial, and
+their zero-inflated wrappers) use
+:class:`~numpyro.contrib.diag_sgd.SmoothedCount`, built on the anchored relaxed
+count :func:`~numpyro.contrib.diag_sgd.anchored_relaxed_count` (and the
+runtime-horizon :func:`~numpyro.contrib.diag_sgd.adaptive_relaxed_count`, which
+accumulates the CDF from the continued log-pmf in a :func:`jax.lax.while_loop`
+and takes distribution-parameter gradients with forward-mode automatic
+differentiation through a custom reverse-mode rule).
+
+**Zero inflation and sparsity.**  A zero-inflated wrapper's log-pmf is the
+mixture :math:`\log[(1 - g)\,p_{\rm base}(k) + g\,1[k = 0]]`, and the
+indicator :math:`1[k = 0]` has no canonical continuation to non-integer
+relaxed counts.  The choice matters: for one occurrence the gate charges
+:math:`C = \log g - \log[(1 - g)\,p_{\rm base}(1)]` nats, and a first-order
+optimiser only ever feels the slope of the continuation where the relaxed count
+sits.  A linear bump ``clip(1 - z, 0, 1)`` spreads that charge as a convex ramp
+over :math:`(0, 1)`, so a faint mark costs :math:`-\log(1 - z)`, about one nat
+per unit near zero -- cheaper than under the un-inflated base family -- and a
+diffuse solution of many faint marks beats a sparse one, which is the opposite
+of what zero inflation is chosen for.
+:class:`~numpyro.contrib.diag_sgd.SmoothedCount` therefore continues the
+indicator with a *log-sum bump* whose cost on :math:`(0, 1)` is
+
+.. math::
+
+    C \, \frac{\log(1 + z / w)}{\log(1 + 1 / w)},
+
+a concave penalty (the usual continuous relaxation of an :math:`\ell_0` count)
+that rises from 0 to the full charge :math:`C` at :math:`z = 1` and is exact on
+the integers.  Its marginal price *falls* as a mark grows, so faint marks are
+expensive per unit and a symmetric state of many faint marks is unstable: mass
+concentrates onto few sites.  The width :math:`w \in (0, 1]` (``zero_width``)
+sets where the charge concentrates and is tied to the temperature by default,
+:math:`w = \min(\eta, 1)`.  Early in the :func:`~numpyro.contrib.diag_sgd.eta_schedule`
+the bump is wide and the price of creating a mark is affordable; as
+:math:`\eta` falls the bump narrows and the continuation tends to the exact
+step.  (The cap at 1 is needed because a wider bump is non-zero at :math:`k =
+1` and breaks exactness on the integers.)  The linear bump is not recoverable by
+narrowing its width: it is flat beyond its wall and convex inside it, so
+annealing it extinguishes every faint mark rather than concentrating them.  This
+concerns the density term only; the relaxed sample is unchanged.
+
+Typical usage anneals :math:`\\eta` over training::
+
+    from numpyro.contrib.diag_sgd import dsgd, count_layers, eta_schedule
+
+    smoothed_model = dsgd(model)
+    ell = count_layers(model, *example_args)
+    schedule = eta_schedule(K=num_steps, ell=ell, eta_final=0.01)
+    for k in range(num_steps):
+        eta = schedule[k]
+        # use smoothed_model(eta, *args) inside your SVI / ELBO step
+
+**References**
+
+1. Wagner, D., Khajwal, B. & Ong, L. *Diagonalisation SGD: Fast & Convergent SGD
+for Non-Differentiable Models via Reparameterisation and Smoothing.* in
+Proceedings of the 27th International Conference on Artificial Intelligence and
+Statistics 1801–1809 (PMLR, 2024).
+
+dsgd
+----
+.. autofunction:: numpyro.contrib.diag_sgd.dsgd
+
+count_layers
+------------
+.. autofunction:: numpyro.contrib.diag_sgd.count_layers
+
+eta_schedule
+------------
+.. autofunction:: numpyro.contrib.diag_sgd.eta_schedule
+
+SmoothedDiscrete
+----------------
+.. autofunction:: numpyro.contrib.diag_sgd.SmoothedDiscrete
+
+SmoothedFinite
+--------------
+.. autoclass:: numpyro.contrib.diag_sgd.SmoothedFinite
+    :members:
+
+relaxed_finite_index
+--------------------
+.. autofunction:: numpyro.contrib.diag_sgd.relaxed_finite_index
+
+SmoothedCount
+-------------
+.. autoclass:: numpyro.contrib.diag_sgd.SmoothedCount
+    :members:
+    :show-inheritance:
+    :member-order: bysource
+
+SmoothICDFTransform
+-------------------
+.. autoclass:: numpyro.contrib.diag_sgd.SmoothICDFTransform
+    :members:
+    :show-inheritance:
+    :member-order: bysource
+
+StraightThroughSmoothed
+-----------------------
+.. autoclass:: numpyro.contrib.diag_sgd.StraightThroughSmoothed
+    :members:
+    :show-inheritance:
+    :member-order: bysource
+
+smooth_cond
+-----------
+.. autofunction:: numpyro.contrib.diag_sgd.smooth_cond
+
+smooth_switch
+-------------
+.. autofunction:: numpyro.contrib.diag_sgd.smooth_switch
+
+smooth_icdf
+-----------
+.. autofunction:: numpyro.contrib.diag_sgd.smooth_icdf
+
+adaptive_relaxed_count
+----------------------
+.. autofunction:: numpyro.contrib.diag_sgd.adaptive_relaxed_count
+
+
+Incremental density computation
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``numpyro.contrib.incremental`` compiles a model to a deterministic *density program*
+(a jaxpr whose inputs are the latent site values and whose outputs are the per-factor
+unsummed log densities) and incrementalizes that program against typed *change
+descriptions*, following [1]. A :class:`~numpyro.contrib.incremental.Change` replaces
+whole sites (``Change.dense``) or a rectangular block of plate elements
+(``Change.sliced``); applying it re-executes only the equations the change reaches,
+reading unchanged intermediate values from a cache, so that updating one element of a
+plated site costs its Markov blanket rather than the whole model. The emitted program
+is an ordinary JAX function and composes with ``jit``, ``vmap`` and ``grad``.
+
+:class:`~numpyro.contrib.incremental.IncrementalMCMC` runs existing kernels as block
+steps on the incremental density: ``HMC``/``NUTS``/``SA`` on continuous blocks (their
+gradient flows only through the factors the block touches) and
+:class:`~numpyro.contrib.incremental.DiscreteGibbs`, which drives the proposal
+functions of :class:`~numpyro.infer.hmc_gibbs.DiscreteHMCGibbs` one plate element at a
+time. ``IncrementalMCMC.from_kernel`` adapts a ``DiscreteHMCGibbs``, ``HMCGibbs``,
+``HMC``, ``NUTS`` or ``SA`` instance directly::
+
+    kernel = IncrementalMCMC.from_kernel(DiscreteHMCGibbs(NUTS(model)))
+    mcmc = MCMC(kernel, num_warmup=500, num_samples=1000)
+    mcmc.run(random.key(0), data)
+
+Limitations: sites marked for parallel enumeration, subsampled plates and latent
+``Delta`` sites are rejected; ``scan``/``cond``/``while`` and unknown primitives fall
+back to dense recomputation (still exact); shapes are static, so open-universe moves
+(births/deaths) must be expressed on fixed-capacity arrays.
+
+**References:**
+
+1. *Incremental Computation for Efficient Programmable Inference in Probabilistic
+   Programs*, Fabian Zaiser et al., PACMPL 10 (PLDI), 2026.
+   https://doi.org/10.1145/3808316
+
+IncrementalDensity
+------------------
+.. autoclass:: numpyro.contrib.incremental.IncrementalDensity
+    :members:
+    :member-order: bysource
+
+Change
+------
+.. autoclass:: numpyro.contrib.incremental.Change
+    :members: dense, sliced, signature
+
+IncrementalMCMC
+---------------
+.. autoclass:: numpyro.contrib.incremental.IncrementalMCMC
+    :members: from_kernel
+    :show-inheritance:
+
+DiscreteGibbs
+-------------
+.. autoclass:: numpyro.contrib.incremental.DiscreteGibbs
+
+GibbsFn
+-------
+.. autoclass:: numpyro.contrib.incremental.GibbsFn
+
+trace_density
+-------------
+.. autofunction:: numpyro.contrib.incremental.trace_density
+
+check_consistency
+-----------------
+.. autofunction:: numpyro.contrib.incremental.check_consistency
