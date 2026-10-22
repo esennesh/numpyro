@@ -103,7 +103,11 @@ slices once.
    `select` under `vmap`), `check_consistency`, gradient equality on the dense path.
 4. ✅ `custom_jvp`: registry (`xlogy`, `xlog1py`, `logaddexp`) re-called on slices,
    recursion into the primal body otherwise, whole rebinding on the dense path.
-5. ⏳ Slice pullback and `cache="plan"`.
+5. ✅ Slice pullback and `cache="plan"` (`plan`, `plan_site_changes`; an unplanned
+   signature raises). Discovered: JAX shares one `Jaxpr` object between call sites of
+   the same function, so variables are keyed by `(call path, var)`; and a cut point
+   inside a body that is rebound whole on the dense path must be refreshed
+   (`Context.refresh_body`), or it goes stale.
 6. ⏳ `adapt.py` and `sa.py` fix; posterior agreement with `DiscreteHMCGibbs`.
 7. ⏳ Docs (`contrib.rst`), `examples/incremental_gmm.py`, benchmark table here.
 

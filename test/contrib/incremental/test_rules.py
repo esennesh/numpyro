@@ -77,7 +77,7 @@ def test_reduce_sum_guard_recovers_from_poisoned_cache():
         if e.primitive is P.reduce_sum_p and e.invars[0].aval.shape == (n,)
     ]
     assert eqns, "expected a reduce_sum over the plate axis"
-    vid = inc.var_ids[eqns[0].outvars[0]]
+    vid = inc.var_id(eqns[0].outvars[0])
     cache = dict(state.cache)
     cache[vid] = jnp.full_like(cache[vid], jnp.nan)
     poisoned = state._replace(cache=cache)

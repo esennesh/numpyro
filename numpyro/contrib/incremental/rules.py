@@ -51,7 +51,9 @@ def materialize(ctx, atom, delta):
 
 def default_rule(ctx, eqn, in_deltas):
     args = [materialize(ctx, a, d) for a, d in zip(eqn.invars, in_deltas)]
-    return [Dense(o) for o in bind(eqn, *args)]
+    outs = bind(eqn, *args)
+    ctx.refresh_body(eqn, args)
+    return [Dense(o) for o in outs]
 
 
 # ----------------------------------------------------------------- elementwise
@@ -301,7 +303,7 @@ RULES[P.gather_p] = gather_rule
 def _call_rule(param_name):
     def rule(ctx, eqn, in_deltas):
         closed = eqn.params[param_name]
-        return ctx.interpret(closed.jaxpr, closed.consts, in_deltas)
+        return ctx.interpret(closed.jaxpr, closed.consts, in_deltas, eqn)
 
     return rule
 
@@ -363,7 +365,7 @@ def custom_jvp_rule(ctx, eqn, in_deltas):
     # Sliced path for an unknown function: interpret the primal body with the Δ-rules
     # (shape-specialised inner equations cannot be rebound on slices). Gradients
     # through this path differentiate the primal rather than the custom rule.
-    return ctx.interpret(closed.jaxpr, closed.consts, in_deltas)
+    return ctx.interpret(closed.jaxpr, closed.consts, in_deltas, eqn)
 
 
 RULES[P.custom_jvp_call_p] = custom_jvp_rule
@@ -375,12 +377,174 @@ def get_rule(primitive):
     return RULES.get(primitive, default_rule)
 
 
+# ----------------------------------------------------------------- pullback
+#
+# ``PULLBACK[primitive](ctx, eqn, out_axes, out_idxs)`` returns the OLD value of the
+# equation's output on the block (``out_axes``, ``out_idxs``) by slicing the inputs
+# and re-running the primitive on the slices, or ``None`` to fall back to reading the
+# cached full value. Each is the inverse of the forward rule's axis bookkeeping.
+
+PULLBACK = {}
+
+
+def _ks(idxs):
+    return [int(i.shape[0]) for i in idxs]
+
+
+def pb_elementwise(ctx, eqn, axes, idxs):
+    out_ndim = len(eqn.outvars[0].aval.shape)
+    args = []
+    for atom in eqn.invars:
+        ndim_in = len(atom.aval.shape)
+        if ndim_in == 0:
+            args.append(ctx.full(atom))
+        elif ndim_in != out_ndim:
+            return None
+        else:
+            args.append(ctx.slice(atom, axes, idxs))
+    return bind(eqn, *args)[0]
+
+
+for _p in ELEMENTWISE:
+    PULLBACK[_p] = pb_elementwise
+
+
+def pb_broadcast_in_dim(ctx, eqn, axes, idxs):
+    if len(eqn.invars) != 1:
+        return None
+    (atom,) = eqn.invars
+    in_shape = atom.aval.shape
+    shape = eqn.params["shape"]
+    bd = tuple(eqn.params["broadcast_dimensions"])
+    in_axes, in_idxs = [], []
+    for o, i in zip(axes, idxs):
+        if o in bd:
+            a = bd.index(o)
+            if in_shape[a] != 1:
+                in_axes.append(a)
+                in_idxs.append(i)
+    sl = ctx.slice(atom, tuple(in_axes), tuple(in_idxs))
+    return lax.broadcast_in_dim(sl, sliced_shape(shape, axes, _ks(idxs)), bd)
+
+
+PULLBACK[P.broadcast_in_dim_p] = pb_broadcast_in_dim
+
+
+def pb_iota(ctx, eqn, axes, idxs):
+    shape = sliced_shape(eqn.params["shape"], axes, _ks(idxs))
+    dim = eqn.params["dimension"]
+    dtype = eqn.params["dtype"]
+    out = lax.broadcasted_iota(dtype, shape, dim)
+    if dim in axes:
+        idx = idxs[axes.index(dim)].astype(dtype)
+        view = [1] * len(shape)
+        view[dim] = shape[dim]
+        out = jnp.broadcast_to(jnp.reshape(idx, view), shape)
+    return out
+
+
+PULLBACK[P.iota_p] = pb_iota
+
+
+def pb_squeeze(ctx, eqn, axes, idxs):
+    (atom,) = eqn.invars
+    ndim = len(atom.aval.shape)
+    dims = tuple(x % ndim for x in eqn.params["dimensions"])
+    kept = [a for a in range(ndim) if a not in dims]
+    in_axes = tuple(kept[o] for o in axes)
+    return lax.squeeze(ctx.slice(atom, in_axes, idxs), dims)
+
+
+PULLBACK[P.squeeze_p] = pb_squeeze
+
+
+def pb_transpose(ctx, eqn, axes, idxs):
+    (atom,) = eqn.invars
+    perm = tuple(eqn.params["permutation"])
+    in_axes = tuple(perm[o] for o in axes)
+    return lax.transpose(ctx.slice(atom, in_axes, idxs), perm)
+
+
+PULLBACK[P.transpose_p] = pb_transpose
+
+
+def pb_reshape(ctx, eqn, axes, idxs):
+    if len(eqn.invars) != 1 or eqn.params.get("dimensions") is not None:
+        return None
+    (atom,) = eqn.invars
+    in_shape = tuple(atom.aval.shape)
+    new_sizes = tuple(eqn.params["new_sizes"])
+    hi = max(axes) + 1
+    if new_sizes[:hi] == in_shape[:hi]:
+        in_axes = axes
+    else:
+        lo = min(axes)
+        n_tail = len(new_sizes) - lo
+        if n_tail <= len(in_shape) and new_sizes[lo:] == in_shape[-n_tail:]:
+            shift = len(in_shape) - len(new_sizes)
+            in_axes = tuple(a + shift for a in axes)
+        else:
+            return None
+    sl = ctx.slice(atom, in_axes, idxs)
+    return jnp.reshape(sl, sliced_shape(new_sizes, axes, _ks(idxs)))
+
+
+PULLBACK[P.reshape_p] = pb_reshape
+
+
+def pb_reduce(ctx, eqn, axes, idxs):
+    if len(eqn.invars) != 1:
+        return None
+    (atom,) = eqn.invars
+    ndim = len(atom.aval.shape)
+    red = tuple(eqn.params["axes"])
+    kept = [a for a in range(ndim) if a not in red]
+    in_axes = tuple(kept[o] for o in axes)
+    return bind(eqn, ctx.slice(atom, in_axes, idxs))[0]
+
+
+for _name in (
+    "reduce_sum",
+    "reduce_max",
+    "reduce_min",
+    "reduce_prod",
+    "reduce_and",
+    "reduce_or",
+):
+    if hasattr(P, _name + "_p"):
+        PULLBACK[getattr(P, _name + "_p")] = pb_reduce
+
+
+def pb_gather(ctx, eqn, axes, idxs):
+    if len(eqn.invars) != 2:
+        return None
+    operand_atom, indices_atom = eqn.invars
+    dn = eqn.params["dimension_numbers"]
+    out_ndim = len(eqn.outvars[0].aval.shape)
+    batch_dims_out = [i for i in range(out_ndim) if i not in dn.offset_dims]
+    if any(o in dn.offset_dims for o in axes):
+        return None
+    ix_axes = tuple(batch_dims_out.index(o) for o in axes)
+    pairs = dict(zip(dn.start_indices_batching_dims, dn.operand_batching_dims))
+    op_axes = tuple(pairs[a] for a in ix_axes if a in pairs)
+    op_idxs = tuple(i for a, i in zip(ix_axes, idxs) if a in pairs)
+    operand = (
+        ctx.slice(operand_atom, op_axes, op_idxs) if op_axes else ctx.full(operand_atom)
+    )
+    indices = ctx.slice(indices_atom, ix_axes, idxs)
+    return bind(eqn, operand, indices)[0]
+
+
+PULLBACK[P.gather_p] = pb_gather
+
+
 def is_literal(atom):
     return isinstance(atom, Literal)
 
 
 __all__ = [
     "RULES",
+    "PULLBACK",
     "ELEMENTWISE",
     "OVERLAP_REDUCE_RULES",
     "bind",
