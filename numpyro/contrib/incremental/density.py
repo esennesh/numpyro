@@ -119,8 +119,13 @@ class DensityProgram:
         args_tree,
         args_leaves_static,
         num_eqns,
+        model=None,
+        deterministic_sites=(),
     ):
         self.jaxpr = jaxpr
+        # The model with param/mutable sites frozen, for replays (postprocessing).
+        self.model = model
+        self.deterministic_sites = tuple(deterministic_sites)
         self.site_names = tuple(site_names)
         self.sites = sites
         self.factor_names = tuple(factor_names)
@@ -348,6 +353,10 @@ def trace_density(
         args_tree=args_tree,
         args_leaves_static=args_leaves_static,
         num_eqns=_count_eqns(closed_jaxpr.jaxpr),
+        model=frozen_model,
+        deterministic_sites=[
+            k for k, s in prototype_trace.items() if s["type"] == "deterministic"
+        ],
     )
     return program, init_values
 

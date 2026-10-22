@@ -11,6 +11,14 @@ al., *Incremental Computation for Efficient Programmable Inference in Probabilis
 Programs* (PLDI 2026, doi:10.1145/3808316).
 """
 
+from numpyro.contrib.incremental.adapt import (
+    Block,
+    DiscreteGibbs,
+    GibbsFn,
+    IncrementalMCMC,
+    IncrementalMCMCState,
+    PotentialBlock,
+)
 from numpyro.contrib.incremental.delta import Change, Dense, Sliced
 from numpyro.contrib.incremental.density import (
     DensityProgram,
@@ -26,12 +34,18 @@ from numpyro.contrib.incremental.incremental import (
 from numpyro.contrib.incremental.interpreter import incrementalize
 
 __all__ = [
+    "Block",
     "Change",
     "Dense",
     "DensityProgram",
+    "DiscreteGibbs",
     "FactorMeta",
+    "GibbsFn",
     "IncrementalDensity",
+    "IncrementalMCMC",
+    "IncrementalMCMCState",
     "IncrementalState",
+    "PotentialBlock",
     "SiteMeta",
     "Sliced",
     "check_consistency",

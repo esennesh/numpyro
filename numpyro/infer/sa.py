@@ -320,8 +320,10 @@ class SA(MCMCKernel):
             self._potential_fn_gen = potential_fn
             if self._postprocess_fn is None:
                 self._postprocess_fn = postprocess_fn
-        else:
+        elif self._init_fn is None:
             self._init_fn, sample_fn = _sa(potential_fn=self._potential_fn)
+        else:
+            sample_fn = self._sample_fn
 
         if self._sample_fn is None:
             self._sample_fn = sample_fn
