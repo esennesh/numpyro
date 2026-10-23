@@ -262,39 +262,205 @@ for _name in (
 # ----------------------------------------------------------------- gather
 
 
-def gather_rule(ctx, eqn, in_deltas):
-    operand_atom, indices_atom = eqn.invars[:2]
-    d_op, d_ix = in_deltas[:2]
-    if not isinstance(d_ix, Sliced) or isinstance(d_op, Dense) or len(eqn.invars) > 2:
-        return default_rule(ctx, eqn, in_deltas)
+def bind_with(eqn, params, *args):
+    """Re-bind ``eqn``'s primitive with modified ``params``."""
+    bind_params = eqn.primitive.get_bind_params(params)
+    with eqn.ctx.manager:
+        out = eqn.primitive.bind(*args, **bind_params)
+    return list(out) if eqn.primitive.multiple_results else [out]
+
+
+def _gather_geometry(eqn):
     dn = eqn.params["dimension_numbers"]
-    ix_ndim = len(indices_atom.aval.shape)
-    if any(a == ix_ndim - 1 for a in d_ix.axes):
-        return default_rule(ctx, eqn, in_deltas)
+    op_shape = eqn.invars[0].aval.shape
+    ix_ndim = len(eqn.invars[1].aval.shape)
     out_ndim = len(eqn.outvars[0].aval.shape)
     batch_dims_out = [i for i in range(out_ndim) if i not in dn.offset_dims]
-    if len(batch_dims_out) != ix_ndim - 1:
-        return default_rule(ctx, eqn, in_deltas)
-    out_axes = tuple(batch_dims_out[a] for a in d_ix.axes)
-    # Operand batching dims paired with sliced index dims must be sliced alike.
+    window_dims = [
+        d
+        for d in range(len(op_shape))
+        if d not in dn.collapsed_slice_dims and d not in dn.operand_batching_dims
+    ]
     pairs = dict(zip(dn.start_indices_batching_dims, dn.operand_batching_dims))
-    op_axes = tuple(pairs[a] for a in d_ix.axes if a in pairs)
-    op_idxs = tuple(i for a, i in zip(d_ix.axes, d_ix.idxs) if a in pairs)
-    if isinstance(d_op, Same):
-        operand = (
-            ctx.slice(operand_atom, op_axes, op_idxs)
-            if op_axes
-            else ctx.full(operand_atom)
+    ok = len(batch_dims_out) == ix_ndim - 1 and len(window_dims) == len(dn.offset_dims)
+    return dn, op_shape, ix_ndim, batch_dims_out, window_dims, pairs, ok
+
+
+def _full_window_dim(dn, op_shape, slice_sizes, a):
+    """Operand dim ``a`` is gathered whole: slicing it slices the matching output dim."""
+    return (
+        a not in dn.collapsed_slice_dims
+        and a not in dn.start_index_map
+        and a not in dn.operand_batching_dims
+        and slice_sizes[a] == op_shape[a]
+    )
+
+
+def gather_rule(ctx, eqn, in_deltas):
+    """
+    ``gather`` stays sliced when (a) the indices are sliced along an index batch dim
+    (the matching output batch dim is sliced; an operand batching dim paired with it
+    is sliced alike), and/or (b) the operand is sliced along a dim that is gathered
+    whole (the matching output offset dim is sliced, e.g. the batch dim of a batched
+    ``diagonal``). A sliced operand along an indexed dim is recomputed densely.
+    """
+    operand_atom, indices_atom = eqn.invars[:2]
+    d_op, d_ix = in_deltas[:2]
+    if (
+        len(eqn.invars) > 2
+        or isinstance(d_op, Dense)
+        or isinstance(d_ix, Dense)
+        or (
+            isinstance(d_op, Sliced)
+            and isinstance(d_ix, Sliced)
+            and d_op.token != d_ix.token
         )
-    else:  # Sliced operand: only acceptable when it is sliced exactly like the pairs
-        if d_op.token != d_ix.token or tuple(d_op.axes) != op_axes:
+    ):
+        return default_rule(ctx, eqn, in_deltas)
+    dn, op_shape, ix_ndim, batch_dims_out, window_dims, pairs, ok = _gather_geometry(
+        eqn
+    )
+    if not ok:
+        return default_rule(ctx, eqn, in_deltas)
+    slice_sizes = list(eqn.params["slice_sizes"])
+    out_axes, out_idxs, token = [], [], None
+    needed = {}  # operand batching dims that must be sliced like the indices
+    if isinstance(d_ix, Sliced):
+        if any(a == ix_ndim - 1 for a in d_ix.axes):
             return default_rule(ctx, eqn, in_deltas)
+        token = d_ix.token
+        for a, i in zip(d_ix.axes, d_ix.idxs):
+            out_axes.append(batch_dims_out[a])
+            out_idxs.append(i)
+            if a in pairs:
+                needed[pairs[a]] = i
+        indices = d_ix.value
+    else:
+        indices = ctx.full(indices_atom)
+    if isinstance(d_op, Sliced):
+        token = d_op.token if token is None else token
+        if any(a not in d_op.axes for a in needed):
+            return default_rule(ctx, eqn, in_deltas)
+        for a, i in zip(d_op.axes, d_op.idxs):
+            if a in needed:
+                continue
+            if not _full_window_dim(dn, op_shape, slice_sizes, a):
+                return default_rule(ctx, eqn, in_deltas)
+            out_axes.append(dn.offset_dims[window_dims.index(a)])
+            out_idxs.append(i)
+            slice_sizes[a] = int(i.shape[0])
         operand = d_op.value
-    out = bind(eqn, operand, d_ix.value)[0]
-    return [Sliced(out_axes, d_ix.idxs, out, d_ix.token)]
+    elif needed:
+        operand = ctx.slice(operand_atom, tuple(needed), tuple(needed.values()))
+    else:
+        operand = ctx.full(operand_atom)
+    params = {**eqn.params, "slice_sizes": tuple(slice_sizes)}
+    out = bind_with(eqn, params, operand, indices)[0]
+    return [Sliced(tuple(out_axes), tuple(out_idxs), out, token)]
 
 
 RULES[P.gather_p] = gather_rule
+
+
+# ----------------------------------------------------------------- batched ops
+
+
+def _batched_rule(core_dims):
+    """
+    Primitives that act independently over leading batch dims (``core_dims`` trailing
+    dims per input are the operation's own): slices along batch dims pass through.
+    """
+
+    def rule(ctx, eqn, in_deltas):
+        if any(isinstance(d, Dense) for d in in_deltas):
+            return default_rule(ctx, eqn, in_deltas)
+        sliced = [d for d in in_deltas if isinstance(d, Sliced)]
+        ref = sliced[0]
+        for d in sliced[1:]:
+            if not d.same_block(ref):
+                return default_rule(ctx, eqn, in_deltas)
+        args = []
+        for atom, d, core in zip(eqn.invars, in_deltas, core_dims):
+            nbatch = len(atom.aval.shape) - core
+            if any(a >= nbatch for a in ref.axes):
+                return default_rule(ctx, eqn, in_deltas)
+            if isinstance(d, Sliced):
+                args.append(d.value)
+            else:
+                args.append(ctx.slice(atom, ref.axes, ref.idxs))
+        outs = bind(eqn, *args)
+        return [Sliced(ref.axes, ref.idxs, o, ref.token) for o in outs]
+
+    return rule
+
+
+RULES[P.cholesky_p] = _batched_rule((2,))
+RULES[P.triangular_solve_p] = _batched_rule((2, 2))
+
+
+def _dot_layout(eqn):
+    (lc, rc), (lb, rb) = eqn.params["dimension_numbers"]
+    l_ndim = len(eqn.invars[0].aval.shape)
+    r_ndim = len(eqn.invars[1].aval.shape)
+    l_free = [d for d in range(l_ndim) if d not in lc and d not in lb]
+    r_free = [d for d in range(r_ndim) if d not in rc and d not in rb]
+    return tuple(lb), tuple(rb), l_free, r_free
+
+
+def dot_general_rule(ctx, eqn, in_deltas):
+    """Slices along batch dims (both operands alike) or along one operand's free dims."""
+    d_l, d_r = in_deltas[:2]
+    if (
+        len(eqn.invars) != 2
+        or any(isinstance(d, Dense) for d in in_deltas)
+        or (
+            isinstance(d_l, Sliced)
+            and isinstance(d_r, Sliced)
+            and d_l.token != d_r.token
+        )
+    ):
+        return default_rule(ctx, eqn, in_deltas)
+    lb, rb, l_free, r_free = _dot_layout(eqn)
+    nb = len(lb)
+    out_axes, out_idxs = [], []
+    l_axes, r_axes = {}, {}  # operand axis -> idx for slicing Same operands
+    token = None
+    for d, this_b, other_b, free, offset, this, other in (
+        (d_l, lb, rb, l_free, nb, l_axes, r_axes),
+        (d_r, rb, lb, r_free, nb + len(l_free), r_axes, l_axes),
+    ):
+        if not isinstance(d, Sliced):
+            continue
+        token = d.token
+        for a, i in zip(d.axes, d.idxs):
+            if a in this_b:
+                j = this_b.index(a)
+                if j not in [this_b.index(x) for x in this if x in this_b]:
+                    out_axes.append(j)
+                    out_idxs.append(i)
+                this[a] = i
+                other[other_b[j]] = i
+            elif a in free:
+                out_axes.append(offset + free.index(a))
+                out_idxs.append(i)
+                this[a] = i
+            else:  # contracting
+                return default_rule(ctx, eqn, in_deltas)
+    args = []
+    for atom, d, need in ((eqn.invars[0], d_l, l_axes), (eqn.invars[1], d_r, r_axes)):
+        if isinstance(d, Sliced):
+            if set(d.axes) != set(need):
+                return default_rule(ctx, eqn, in_deltas)
+            args.append(d.value)
+        elif need:
+            args.append(ctx.slice(atom, tuple(need), tuple(need.values())))
+        else:
+            args.append(ctx.full(atom))
+    out = bind(eqn, *args)[0]
+    return [Sliced(tuple(out_axes), tuple(out_idxs), out, token)]
+
+
+RULES[P.dot_general_p] = dot_general_rule
 
 
 # ----------------------------------------------------------------- calls
@@ -519,23 +685,80 @@ def pb_gather(ctx, eqn, axes, idxs):
     if len(eqn.invars) != 2:
         return None
     operand_atom, indices_atom = eqn.invars
-    dn = eqn.params["dimension_numbers"]
-    out_ndim = len(eqn.outvars[0].aval.shape)
-    batch_dims_out = [i for i in range(out_ndim) if i not in dn.offset_dims]
-    if any(o in dn.offset_dims for o in axes):
-        return None
-    ix_axes = tuple(batch_dims_out.index(o) for o in axes)
-    pairs = dict(zip(dn.start_indices_batching_dims, dn.operand_batching_dims))
-    op_axes = tuple(pairs[a] for a in ix_axes if a in pairs)
-    op_idxs = tuple(i for a, i in zip(ix_axes, idxs) if a in pairs)
-    operand = (
-        ctx.slice(operand_atom, op_axes, op_idxs) if op_axes else ctx.full(operand_atom)
+    dn, op_shape, ix_ndim, batch_dims_out, window_dims, pairs, ok = _gather_geometry(
+        eqn
     )
-    indices = ctx.slice(indices_atom, ix_axes, idxs)
-    return bind(eqn, operand, indices)[0]
+    if not ok:
+        return None
+    slice_sizes = list(eqn.params["slice_sizes"])
+    op_axes, ix_axes = {}, {}
+    for o, i in zip(axes, idxs):
+        if o in dn.offset_dims:
+            a = window_dims[dn.offset_dims.index(o)]
+            if not _full_window_dim(dn, op_shape, slice_sizes, a):
+                return None
+            op_axes[a] = i
+            slice_sizes[a] = int(i.shape[0])
+        else:
+            j = batch_dims_out.index(o)
+            ix_axes[j] = i
+            if j in pairs:
+                op_axes[pairs[j]] = i
+    operand = (
+        ctx.slice(operand_atom, tuple(op_axes), tuple(op_axes.values()))
+        if op_axes
+        else ctx.full(operand_atom)
+    )
+    indices = (
+        ctx.slice(indices_atom, tuple(ix_axes), tuple(ix_axes.values()))
+        if ix_axes
+        else ctx.full(indices_atom)
+    )
+    params = {**eqn.params, "slice_sizes": tuple(slice_sizes)}
+    return bind_with(eqn, params, operand, indices)[0]
 
 
 PULLBACK[P.gather_p] = pb_gather
+
+
+def _pb_batched(core_dims):
+    def pb(ctx, eqn, axes, idxs):
+        args = []
+        for atom, core in zip(eqn.invars, core_dims):
+            if any(a >= len(atom.aval.shape) - core for a in axes):
+                return None
+            args.append(ctx.slice(atom, axes, idxs))
+        return bind(eqn, *args)[0]
+
+    return pb
+
+
+PULLBACK[P.cholesky_p] = _pb_batched((2,))
+PULLBACK[P.triangular_solve_p] = _pb_batched((2, 2))
+
+
+def pb_dot_general(ctx, eqn, axes, idxs):
+    lb, rb, l_free, r_free = _dot_layout(eqn)
+    nb = len(lb)
+    l_axes, r_axes = {}, {}
+    for o, i in zip(axes, idxs):
+        if o < nb:
+            l_axes[lb[o]] = i
+            r_axes[rb[o]] = i
+        elif o < nb + len(l_free):
+            l_axes[l_free[o - nb]] = i
+        else:
+            r_axes[r_free[o - nb - len(l_free)]] = i
+    args = []
+    for atom, need in ((eqn.invars[0], l_axes), (eqn.invars[1], r_axes)):
+        if need:
+            args.append(ctx.slice(atom, tuple(need), tuple(need.values())))
+        else:
+            args.append(ctx.full(atom))
+    return bind(eqn, *args)[0]
+
+
+PULLBACK[P.dot_general_p] = pb_dot_general
 
 
 def is_literal(atom):
