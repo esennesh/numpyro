@@ -594,6 +594,10 @@ DiscreteGibbs
 -------------
 .. autoclass:: numpyro.contrib.incremental.DiscreteGibbs
 
+RandomWalk
+----------
+.. autoclass:: numpyro.contrib.incremental.RandomWalk
+
 GibbsFn
 -------
 .. autoclass:: numpyro.contrib.incremental.GibbsFn

@@ -9,7 +9,7 @@ from jax import random
 import jax.numpy as jnp
 
 import numpyro
-from numpyro.contrib.incremental import DiscreteGibbs, IncrementalMCMC
+from numpyro.contrib.incremental import DiscreteGibbs, IncrementalMCMC, RandomWalk
 import numpyro.distributions as dist
 from numpyro.infer import HMC, MCMC, NUTS, SA, DiscreteHMCGibbs, HMCGibbs
 
@@ -149,6 +149,31 @@ def test_plain_hmc_adapts():
     assert_allclose(mu.mean(), post_var * y.sum(), atol=0.15)
     assert_allclose(mu.var(), post_var, atol=0.1)
     assert "acc. prob" in kernel.get_diagnostics_str(mcmc.last_state)
+
+
+def test_random_walk_block_targets_posterior():
+    def model(y):
+        mu = numpyro.sample("mu", dist.Normal(0.0, 10.0))
+        s = numpyro.sample("s", dist.LogNormal(0.0, 1.0))
+        numpyro.sample("obs", dist.Normal(mu, s), obs=y)
+
+    y = jnp.array([1.0, 2.0, 3.0, 4.0])
+    ref = MCMC(NUTS(model), num_warmup=500, num_samples=4000, progress_bar=False)
+    ref.run(random.key(0), y)
+    kernel = IncrementalMCMC(
+        model, [("mu", RandomWalk(scale=0.8)), ("s", RandomWalk(scale=0.5))]
+    )
+    mcmc = MCMC(kernel, num_warmup=500, num_samples=40000, progress_bar=False)
+    mcmc.run(random.key(1), y)
+    a, b = ref.get_samples(), mcmc.get_samples()
+    for name in ("mu", "s"):
+        assert_allclose(b[name].mean(), a[name].mean(), atol=0.15)
+        assert_allclose(b[name].std(), a[name].std(), atol=0.15)
+    assert "rw acc. prob" in kernel.get_diagnostics_str(mcmc.last_state)
+    with pytest.raises(ValueError, match="continuous"):
+        IncrementalMCMC(
+            plated_gmm, [("z", RandomWalk()), (None, NUTS(plated_gmm))]
+        ).init(random.key(0), 10, None, (_gmm_data(10),), {})
 
 
 def test_step_validation():

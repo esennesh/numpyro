@@ -178,7 +178,9 @@ class Context:
         self.inputs = inputs  # {((), invar): old value}
         self.consts = {}  # {(path, constvar): value}
         self.updates = {}  # {var_id: new full value}
+        self.pending = []  # [(var_id, key, Δ)] cache writes deferred to the end
         self.reads = set()  # ids read in full (for cache planning)
+        self.input_full_reads = set()  # input keys read in full (not just sliced)
         self.write_updates = write_updates
         self.num_eqns = 0
         self.path = ()
@@ -197,6 +199,7 @@ class Context:
         if key in self.consts:
             return self.consts[key]
         if key in self.inputs:
+            self.input_full_reads.add(key)
             return self.inputs[key]
         i = self.var_ids[key]
         self.reads.add(i)
@@ -223,6 +226,9 @@ class Context:
         if not axes:
             return self.full(atom)
         key = self.resolve(atom)
+        if not isinstance(key, Literal) and key in self.inputs:
+            # A sliced read of an input is not a full read (see input_full_reads).
+            return gather_rect(self.inputs[key], axes, idxs)
         if self.pullback and not isinstance(key, Literal):
             prod = self.producers.get(key)
             if prod is not None:
@@ -337,12 +343,25 @@ class Context:
                     and key not in self.alias  # call outputs are updated by the body
                     and self.var_ids.get(key) in self.cache_keys
                 ):
-                    self.updates[self.var_ids[key]] = (
-                        d.value
-                        if isinstance(d, Dense)
-                        else self.materialize_sliced(v, d)
-                    )
+                    # Deferred: in-place writes must come after every read of the
+                    # old values, see ``flush_updates``.
+                    self.pending.append((self.var_ids[key], key, d))
         return [read(v) for v in jaxpr.outvars]
+
+    def flush_updates(self, values):
+        """
+        Materialize the deferred cache writes with (barriered) new ``values``: a
+        dynamic-update-slice for sliced variables, a replacement for dense ones.
+        """
+        for (i, key, d), value in zip(self.pending, values):
+            if isinstance(d, Dense):
+                self.updates[i] = value
+            else:
+                self.updates[i] = scatter_rect(
+                    self.full_key(key), d.axes, d.idxs, value
+                )
+        self.pending = []
+        return self.updates
 
 
 # --------------------------------------------------------------------- program
@@ -381,12 +400,13 @@ def incrementalize(program, table, signature_change, cache_keys, pullback=False)
     site_invars = jaxpr.invars[: program.num_site_inputs]
     info = {}
 
-    def run(site_values, arg_leaves, cache, change, write_updates):
+    def run(site_values, arg_leaves, cache, change, write_updates, read_values=None):
         deltas = input_deltas(change, program)
         inputs = {}
         in_deltas = []
+        read_values = site_values if read_values is None else read_values
         for name, v in zip(program.site_names, site_invars):
-            inputs[((), v)] = site_values[name]
+            inputs[((), v)] = read_values[name]
             in_deltas.append(deltas.get(name, SAME))
         for v, a in zip(jaxpr.invars[program.num_site_inputs :], arg_leaves):
             inputs[((), v)] = a
@@ -405,13 +425,34 @@ def incrementalize(program, table, signature_change, cache_keys, pullback=False)
         info["tags"] = tags
         info["num_eqns"] = ctx.num_eqns
         info["reads"] = frozenset(ctx.reads)
-        return delta, factor_deltas, ctx.updates
+        site_of = dict(zip(site_invars, program.site_names))
+        info["input_full_reads"] = frozenset(
+            site_of[key[1]] for key in ctx.input_full_reads if key[1] in site_of
+        )
+        if not write_updates:
+            return delta, factor_deltas, {}, change
+        # Cache writes are deferred until every read of an old value is done.
+        pending_values = [d.value for _, _, d in ctx.pending]
+        updates = ctx.flush_updates(pending_values)
+        return delta, factor_deltas, updates, change
 
-    def apply(site_values, arg_leaves, cache, change):
-        return run(site_values, arg_leaves, cache, change, True)
+    def apply(site_values, arg_leaves, cache, change, read_values=None):
+        """
+        Returns ``(delta, factor_deltas, cache_updates, change)``.
 
-    def apply_delta(site_values, arg_leaves, cache, change):
-        delta, factor_deltas, _ = run(site_values, arg_leaves, cache, change, False)
+        ``read_values`` (default ``site_values``) are the values the program reads;
+        a sweep over distinct elements of one site may pass a snapshot taken before
+        the sweep so that the carried site array is only written inside the loop
+        (XLA CPU copies a loop-carried buffer that is both read and updated in
+        place, which would make each element update O(N)). This is exact when the
+        changed sites are not read in full (``info["input_full_reads"]``).
+        """
+        return run(site_values, arg_leaves, cache, change, True, read_values)
+
+    def apply_delta(site_values, arg_leaves, cache, change, read_values=None):
+        delta, factor_deltas, _, _ = run(
+            site_values, arg_leaves, cache, change, False, read_values
+        )
         return delta, factor_deltas
 
     return IncrementalProgram(signature_change.signature, apply, apply_delta, info)
