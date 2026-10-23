@@ -169,10 +169,25 @@ kernels at 0.5× of full recomputation:
 | mixture parameters | 500 | 13.8 µs | 13.8 µs | 1.0× |
 | mixture parameters | 5 000 | 240 µs | 224 µs | 0.9× |
 
-XLA's vectorised full evaluation is far cheaper than the Julia baseline, so absolute
-numbers differ, but the structure matches the paper: single-site updates are constant
-in N and the dense parameter moves pay the incremental overhead (0.5× at N = 1 000,
-exactly the paper's ratio). The assignment update of the mixture runs a batched
+In the layout of the paper's Table 1 (median ms per kernel application at the paper's
+sizes; the paper's columns are its Julia prototype, its full recomputation and Gen.jl,
+the NumPyro columns are this branch and from-scratch `log_density`):
+
+| Model / MCMC kernel | Inc (ms) | Full (ms) | Gen (ms) | Full/Inc | Gen/Inc | NumPyro Inc (ms) | NumPyro Full (ms) | Full/Inc |
+|---|---|---|---|---|---|---|---|---|
+| **Robust Regression (N = 1 000)** | | | | | | | | |
+| Parameter change | 5.93 | 3.05 | 1.77 | 0.51× | 0.30× | 0.00097 | 0.00045 | 0.46× |
+| Outlier status change | 0.017 | 3.06 | 0.010 | 176× | 0.59× | 0.000027 | 0.0011 | 42× |
+| **Binary Gaussian Mixture (N = 500)** | | | | | | | | |
+| Parameters change | 3.91 | 1.85 | 0.78 | 0.47× | 0.20× | 0.0138 | 0.0138 | 1.0× |
+| Cluster assignment change | 0.028 | 1.68 | 0.013 | 61× | 0.46× | 0.00052 | 0.0128 | 25× |
+
+XLA's vectorised full evaluation is far cheaper than the Julia baseline (about 2 800×
+for the regression and 130× for the mixture), so absolute numbers differ, but the
+structure matches the paper: single-site updates are constant in N and the dense
+parameter moves pay the incremental overhead (0.46× at N = 1 000, the paper's 0.51×).
+The paper's single-site speedups are larger because its full baseline is slower; at
+10× the data size ours reach 1 381× and 449× (table above). The assignment update of the mixture runs a batched
 Cholesky factorisation, triangular solve and diagonal gather on the sliced path, which
 needed rules of their own (below).
 
