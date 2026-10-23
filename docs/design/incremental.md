@@ -138,33 +138,43 @@ kernel and quadratic for the reference; the NUTS block is linear in both, so the
 crossover sits around N ≈ 1 000 on CPU and the gap widens from there. Constant factors
 dominate at small N, as the paper also reports for Gen.
 
-**Paper case studies 1 and 2, `examples/incremental_case_studies.py`.** Robust
-regression (Box & Tiao outliers, N = 1 000) and the binary 2-D Gaussian mixture
-(N = 500), with the paper's kernels: Gaussian-drift Metropolis on the parameters
-(`RandomWalk`) and single-site updates of the indicators / assignments
-(`DiscreteGibbs`). Both recover the truth (regression: slope 1.99, intercept −1.01,
-σ 0.49, 97.7 % of indicators; mixture: both means and scales, the weight, every
-assignment). Median µs per kernel application inside one compiled sweep (incremental
-`apply` with cache write vs full recomputation of the joint density); the paper's
-Julia prototype reports 17 µs vs 3 060 µs for an outlier flip, 28 µs vs 1 680 µs for an
-assignment, and parameter moves at 0.5× of full recomputation:
+**Paper case studies 1 and 2, `examples/incremental_case_studies.py`.** The models,
+priors, kernels and data protocol are those of the paper's artifact (Zenodo
+10.5281/zenodo.19080766, `artifact.zip`, md5 `94abc95ed9fc85a7d793ed04502dbb1d`,
+`examples/robust_regression/{inc_version,consts,inference}.jl` and
+`examples/gmms/binary_gmm/…`): robust regression with `m, b ~ Normal(0, 1)`, x on a grid
+from −5 to 5, outlier probability 0.1, inlier noise 0.5, outliers `Normal(0, 100)`, a
+joint drift of width 0.5 on `(m, b)` and a Metropolis flip per indicator (N = 1 000);
+the binary 2-D mixture with `weight ~ Beta(0.5, 0.5)`, per component
+`Σ ~ InverseWishart(3.2, 1.6 I)` and `μ ~ Normal(μ₀, Σ/0.4)`, `μ₀ = (−2, −2), (2, 2)`,
+exact-conditional assignment updates and a conjugate Normal-Inverse-Wishart / Beta
+resample of all parameters (`GibbsFn`) (N = 500). Data are simulated from the prior
+and inference starts from a fresh prior draw, as in the artifact (for the mixture the
+first prior draw with a non-degenerate weight). Both recover the ground truth
+(regression: m −2.434 vs −2.442, b −1.265 vs −1.257, 99.8 % of indicators; mixture:
+both means to 0.1, the weight 0.56 exactly, every assignment). Median µs per kernel
+application inside one compiled sweep (incremental `apply` with cache write vs full
+recomputation of the joint density); the paper's Julia prototype reports 17 µs vs
+3 060 µs for an outlier flip, 28 µs vs 1 680 µs for an assignment, and the parameter
+kernels at 0.5× of full recomputation:
 
 | kernel | N | incremental | full | speedup |
 |---|---|---|---|---|
-| outlier status | 1 000 | 0.03 µs | 1.20 µs | 45× |
-| outlier status | 10 000 | 0.01 µs | 12.35 µs | 1 264× |
-| regression parameters | 1 000 | 4.10 µs | 1.69 µs | 0.4× |
-| regression parameters | 10 000 | 16.6 µs | 14.5 µs | 0.9× |
-| cluster assignment | 500 | 0.02 µs | 1.23 µs | 51× |
-| cluster assignment | 5 000 | 0.02 µs | 91.1 µs | 5 866× |
-| mixture parameters | 500 | 4.11 µs | 1.84 µs | 0.4× |
-| mixture parameters | 5 000 | 23.3 µs | 90.4 µs | 3.9× |
+| outlier status | 1 000 | 0.03 µs | 1.11 µs | 42× |
+| outlier status | 10 000 | 0.01 µs | 13.2 µs | 1 381× |
+| regression parameters | 1 000 | 0.97 µs | 0.45 µs | 0.5× |
+| regression parameters | 10 000 | 4.0 µs | 4.6 µs | 1.1× |
+| cluster assignment | 500 | 0.52 µs | 12.8 µs | 25× |
+| cluster assignment | 5 000 | 0.49 µs | 220 µs | 449× |
+| mixture parameters | 500 | 13.8 µs | 13.8 µs | 1.0× |
+| mixture parameters | 5 000 | 240 µs | 224 µs | 0.9× |
 
-XLA's vectorised full evaluation is three orders of magnitude cheaper than the Julia
-baseline, so absolute numbers differ, but the structure matches the paper: single-site
-updates are constant in N and the dense parameter moves pay the incremental overhead.
-The priors are standard choices; the paper's exact priors live in its artifact
-(Zenodo 10.5281/zenodo.19080766), not in the text.
+XLA's vectorised full evaluation is far cheaper than the Julia baseline, so absolute
+numbers differ, but the structure matches the paper: single-site updates are constant
+in N and the dense parameter moves pay the incremental overhead (0.5× at N = 1 000,
+exactly the paper's ratio). The assignment update of the mixture runs a batched
+Cholesky factorisation, triangular solve and diagonal gather on the sliced path, which
+needed rules of their own (below).
 
 Later: `scan` rule for Markov structure; data-dependent `gather` sparsity (the paper's
 `using`); `memo` primitive for latent-independent intermediates; masked fixed-capacity
@@ -202,3 +212,10 @@ data growth (SMC-style); `MixedHMC`; `BarkerMH`.
 - 2026-10-22: `RandomWalk` block (Gaussian drift in unconstrained space) added for the
   paper's parameter kernels; `IncrementalMCMC` initialises with `init_to_uniform`
   like HMC (prior samples left the mixture examples in poor modes).
+- 2026-10-22: The paper's artifact (downloaded and checksummed, see the benchmark)
+  fixes the case-study models; the mixture's parameter kernel is a conjugate
+  Normal-Inverse-Wishart resample, not a drift. Porting it required sliced rules for
+  batched `cholesky` and `triangular_solve` (leading batch dims pass through), for
+  `gather` along an operand dim gathered whole (a batched `diagonal`), and for
+  `dot_general` along batch dims or one operand's free dims, each with its pullback;
+  the zoo gained `mvn_mixture` and `matrix_product` to pin them.

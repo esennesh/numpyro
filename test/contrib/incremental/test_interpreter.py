@@ -117,6 +117,10 @@ EXPECTED_TAGS = {
     ("discrete", "b"): {"b": "Sliced", "obs": "Sliced", "k": "Same"},
     # x.sum() feeds tot: the reduce_sum delta rule keeps it O(1) but Dense.
     ("reduction", "x"): {"x": "Sliced", "obs": "Sliced", "tot": "Dense"},
+    # batched cholesky / triangular_solve / diagonal gather stay sliced
+    ("mvn_mixture", "z"): {"z": "Sliced", "obs": "Sliced", "mu": "Same", "cov": "Same"},
+    # dot_general along a sliced free dim stays sliced
+    ("matrix_product", "h"): {"h": "Sliced", "obs": "Sliced"},
     ("prebatched", "z"): {"obs": "Sliced", "z": "Sliced", "mu": "Same"},
     ("subsampled", "z"): {"obs": "Sliced", "z": "Sliced", "mu": "Same"},
     ("scaled", "mu"): {"obs": "Dense", "pen": "Dense", "mu": "Dense"},

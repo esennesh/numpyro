@@ -113,6 +113,28 @@ def static_arg(y, num_groups):
         numpyro.sample("obs", dist.Normal(mu[g], 1.0), obs=y)
 
 
+def mvn_mixture(points):
+    """Batched cholesky / triangular_solve / diagonal gather on the sliced path."""
+    with numpyro.plate("component", 2):
+        cov = numpyro.sample("cov", dist.InverseWishart(3.2, 1.6 * jnp.eye(2)))
+        mu = numpyro.sample(
+            "mu",
+            dist.MultivariateNormal(jnp.zeros(2), covariance_matrix=cov / 0.4),
+        )
+    with numpyro.plate("data", points.shape[0]):
+        z = numpyro.sample("z", dist.Bernoulli(0.4))
+        numpyro.sample(
+            "obs", dist.MultivariateNormal(mu[z], covariance_matrix=cov[z]), obs=points
+        )
+
+
+def matrix_product(y, w):
+    """dot_general with a sliced free dim (rows of a latent matrix)."""
+    with numpyro.plate("data", y.shape[0]):
+        h = numpyro.sample("h", dist.Normal(0.0, 1.0).expand([3]).to_event(1))
+        numpyro.sample("obs", dist.Normal(h @ w, 1.0), obs=y)
+
+
 def build_zoo(n=12):
     # NumPy data only: the repository's conftest forbids live JAX arrays at import.
     rng = _rng()
@@ -132,6 +154,10 @@ def build_zoo(n=12):
         "hmm": Entry(hmm, (y,), {}),
         "scaled": Entry(scaled, (y,), {}),
         "static_arg": Entry(static_arg, (y,), {"num_groups": 4}),
+        "mvn_mixture": Entry(mvn_mixture, (rng.randn(n, 2).astype(np.float32),), {}),
+        "matrix_product": Entry(
+            matrix_product, (y, rng.randn(3).astype(np.float32)), {}
+        ),
     }
 
 
