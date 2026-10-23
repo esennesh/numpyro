@@ -37,19 +37,28 @@ from numpyro.contrib.incremental.incremental import IncrementalDensity
 from numpyro.handlers import seed, substitute, trace
 from numpyro.infer.hmc import HMC, hmc
 from numpyro.infer.hmc_gibbs import DiscreteHMCGibbs, HMCGibbs, _wrap_model
-from numpyro.infer.initialization import init_to_sample
+from numpyro.infer.initialization import init_to_uniform
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.sa import SA, _sa
 from numpyro.util import identity, is_prng_key
 
-IncrementalMCMCState = namedtuple(
-    "IncrementalMCMCState", ["z", "inc", "blocks", "rng_key", "i"]
-)
-IncrementalMCMCState.__doc__ = """
-State of :class:`IncrementalMCMC`: ``z`` the latent values (continuous sites
-unconstrained), ``inc`` the :class:`IncrementalState`, ``blocks`` a tuple with one
-sub-state per step, ``rng_key`` and the iteration counter ``i``.
-"""
+
+class IncrementalMCMCState(
+    namedtuple("IncrementalMCMCState", ["inc", "blocks", "rng_key", "i"])
+):
+    """
+    State of :class:`IncrementalMCMC`: ``inc`` the :class:`IncrementalState` (whose
+    ``z`` are the latent values, continuous sites unconstrained), ``blocks`` a tuple
+    with one sub-state per step, ``rng_key`` and the iteration counter ``i``. ``z`` is
+    a view of ``inc.z`` rather than a second field, so the carried arrays are not
+    duplicated (XLA would copy one of two aliases on every in-place update).
+    """
+
+    __slots__ = ()
+
+    @property
+    def z(self):
+        return self.inc.z
 
 
 def _unset_potential(z):
@@ -273,25 +282,104 @@ class DiscreteGibbs(Block):
             else:
                 order = jnp.arange(n)
 
-            def body(j, carry, site=site, meta=meta):
+            # Within the sweep every element is read only at its own position, so
+            # reads can come from a snapshot taken before the loop whenever the
+            # site's factors depend on it elementwise; the carried arrays are then
+            # only written in the loop body, which XLA keeps in place.
+            probe = self._change_for(meta, site, 0, jnp.zeros((), int))
+            snapshot = state.z if site not in inc.input_full_reads(probe) else None
+
+            def body(j, carry, site=site, meta=meta, snapshot=snapshot):
                 rng_key, state = carry
                 e = order[j]
-                cur = jnp.reshape(state.z[site], (-1,))[e]
+                reads = state.z if snapshot is None else snapshot
+                cur = jnp.reshape(reads[site], (-1,))[e]
 
                 def delta_of(c):
                     change = self._change_for(meta, site, c, e)
-                    return inc.apply_delta(state, change, model_args, model_kwargs)[0]
+                    return inc.apply_delta(
+                        state, change, model_args, model_kwargs, read_values=snapshot
+                    )[0]
 
                 deltas = vmap(delta_of)(candidates)
                 deltas = jnp.where(jnp.isfinite(deltas), deltas, -jnp.inf)
                 rng_key, rng_prop = random.split(rng_key)
                 new = self._propose(rng_prop, deltas, cur, support_size)
                 change = self._change_for(meta, site, new, e)
-                _, state = inc.apply(state, change, model_args, model_kwargs)
+                _, state = inc.apply(
+                    state, change, model_args, model_kwargs, read_values=snapshot
+                )
                 return rng_key, state
 
             rng_key, state = lax.fori_loop(0, n, body, (rng_key, state))
         return state, block_state
+
+
+RandomWalkState = namedtuple("RandomWalkState", ["num_accepted", "num_steps"])
+
+
+class RandomWalk(Block):
+    """
+    Gaussian-drift Metropolis updates of a block of continuous sites in unconstrained
+    space: propose ``z + scale * N(0, I)`` and accept with probability
+    ``min(1, exp(delta))`` where ``delta`` is the incremental change in joint log
+    density (the Jacobian factors of the unconstraining transforms are part of it).
+
+    :param scale: proposal standard deviation, a float or a ``{site: scale}`` dict.
+    """
+
+    def __init__(self, scale=0.1):
+        self.scale = scale
+
+    def bind(self, inc, sites):
+        for s in sites:
+            if inc.sites[s].is_discrete:
+                raise ValueError(
+                    f"RandomWalk needs continuous sites; '{s}' is discrete."
+                )
+        super().bind(inc, sites)
+
+    def plan(self, inc):
+        return [
+            Change.dense(
+                {
+                    s: jnp.zeros(inc.sites[s].shape, inc.sites[s].dtype)
+                    for s in self.sites
+                }
+            )
+        ]
+
+    def init(self, inc, state, rng_key, num_warmup, model_args, model_kwargs):
+        return RandomWalkState(jnp.zeros(()), jnp.zeros(()))
+
+    def _scale(self, site):
+        if isinstance(self.scale, dict):
+            return self.scale[site]
+        return self.scale
+
+    def sample(self, inc, state, block_state, rng_key, model_args, model_kwargs):
+        keys = random.split(rng_key, 1 + len(self.sites))
+        proposal = {
+            s: state.z[s]
+            + self._scale(s) * random.normal(k, jnp.shape(state.z[s]), state.z[s].dtype)
+            for s, k in zip(self.sites, keys[1:])
+        }
+        delta, _ = inc.apply_delta(
+            state, Change.dense(proposal), model_args, model_kwargs
+        )
+        delta = jnp.where(jnp.isfinite(delta), delta, -jnp.inf)
+        accept = random.exponential(keys[0]) > -delta
+        new = {s: jnp.where(accept, proposal[s], state.z[s]) for s in self.sites}
+        _, state = inc.apply(state, Change.dense(new), model_args, model_kwargs)
+        block_state = RandomWalkState(
+            block_state.num_accepted + accept, block_state.num_steps + 1
+        )
+        return state, block_state
+
+    def diagnostics(self, block_state):
+        return "rw acc. prob={:.2f}".format(
+            block_state.num_accepted / jnp.maximum(block_state.num_steps, 1)
+        )
 
 
 class GibbsFn(Block):
@@ -370,7 +458,7 @@ class IncrementalMCMC(MCMCKernel):
         cache="plan",
         resync_every=0,
         validate=False,
-        init_strategy=init_to_sample,
+        init_strategy=init_to_uniform,
     ):
         self._model = model
         self._steps = [self._as_block(sites, kernel) for sites, kernel in steps]
@@ -526,7 +614,7 @@ class IncrementalMCMC(MCMCKernel):
             b.init(inc, state, k, self._num_warmup, model_args, model_kwargs)
             for b, k in zip(self._blocks, block_keys)
         )
-        return IncrementalMCMCState(state.z, state, blocks, rng_key, jnp.zeros((), int))
+        return IncrementalMCMCState(state, blocks, rng_key, jnp.zeros((), int))
 
     def _sample_one(self, state, model_args, model_kwargs):
         inc = self._inc
@@ -546,7 +634,7 @@ class IncrementalMCMC(MCMCKernel):
                 identity,
                 inc_state,
             )
-        return IncrementalMCMCState(inc_state.z, inc_state, tuple(blocks), rng_key, i)
+        return IncrementalMCMCState(inc_state, tuple(blocks), rng_key, i)
 
     def sample(self, state, model_args, model_kwargs):
         model_kwargs = {} if model_kwargs is None else model_kwargs
@@ -597,4 +685,5 @@ __all__ = [
     "IncrementalMCMC",
     "IncrementalMCMCState",
     "PotentialBlock",
+    "RandomWalk",
 ]

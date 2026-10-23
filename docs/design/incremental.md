@@ -115,22 +115,56 @@ slices once.
    `DiscreteHMCGibbs`; exact conjugate posterior for a `gibbs_fn` block; vectorized
    chains; total in sync with from-scratch evaluation after a run with `resync_every`.
 7. ✅ Docs (`contrib.rst`), `examples/incremental_gmm.py`, benchmark below.
+8. ✅ Paper case studies 1 and 2 (`examples/incremental_case_studies.py`), the
+   `RandomWalk` block, and the sweep snapshot fix that makes single-site updates O(1)
+   in practice, not only in the emitted program.
 
-## Benchmark (2026-10-22, CPU, `examples/incremental_gmm.py`, K = 3)
+## Benchmarks (2026-10-22, CPU)
 
-`DiscreteHMCGibbs(NUTS(model))` as is versus the same kernel through
-`IncrementalMCMC.from_kernel`; wall time of a compiled run of 300 steps (100 warmup):
+**`examples/incremental_gmm.py`, K = 3.** `DiscreteHMCGibbs(NUTS(model))` as is versus
+the same kernel through `IncrementalMCMC.from_kernel`; wall time of a compiled run of
+600 steps (300 warmup); posteriors agree to 0.005 at N = 400 and 0.001 at N = 8 000
+(at N = 2 000 the reference's short run sits in a wide-component local mode):
 
 | N | DiscreteHMCGibbs | incremental |
 |---|---|---|
-| 400 | 0.79 s | 0.96 s |
-| 2 000 | 4.14 s | 2.86 s |
+| 400 | 1.13 s | 1.28 s |
+| 2 000 | 8.17 s | 5.28 s |
+| 8 000 | 114.7 s | 19.3 s |
 
 One assignment update compiles to 23 flops with 18 of 124 equations re-executed at
-N = 400, 2 000, 4 000 and 20 000. The per-sweep cost of the discrete block is linear in
-N for the incremental kernel and quadratic for the reference; the NUTS block is linear
-in both, so the crossover sits around N ≈ 1 000 on CPU and the gap widens from there.
-Constant factors dominate at small N, as the paper also reports for Gen.
+N = 400, 2 000, 4 000 and 20 000. The discrete sweep is linear in N for the incremental
+kernel and quadratic for the reference; the NUTS block is linear in both, so the
+crossover sits around N ≈ 1 000 on CPU and the gap widens from there. Constant factors
+dominate at small N, as the paper also reports for Gen.
+
+**Paper case studies 1 and 2, `examples/incremental_case_studies.py`.** Robust
+regression (Box & Tiao outliers, N = 1 000) and the binary 2-D Gaussian mixture
+(N = 500), with the paper's kernels: Gaussian-drift Metropolis on the parameters
+(`RandomWalk`) and single-site updates of the indicators / assignments
+(`DiscreteGibbs`). Both recover the truth (regression: slope 1.99, intercept −1.01,
+σ 0.49, 97.7 % of indicators; mixture: both means and scales, the weight, every
+assignment). Median µs per kernel application inside one compiled sweep (incremental
+`apply` with cache write vs full recomputation of the joint density); the paper's
+Julia prototype reports 17 µs vs 3 060 µs for an outlier flip, 28 µs vs 1 680 µs for an
+assignment, and parameter moves at 0.5× of full recomputation:
+
+| kernel | N | incremental | full | speedup |
+|---|---|---|---|---|
+| outlier status | 1 000 | 0.03 µs | 1.20 µs | 45× |
+| outlier status | 10 000 | 0.01 µs | 12.35 µs | 1 264× |
+| regression parameters | 1 000 | 4.10 µs | 1.69 µs | 0.4× |
+| regression parameters | 10 000 | 16.6 µs | 14.5 µs | 0.9× |
+| cluster assignment | 500 | 0.02 µs | 1.23 µs | 51× |
+| cluster assignment | 5 000 | 0.02 µs | 91.1 µs | 5 866× |
+| mixture parameters | 500 | 4.11 µs | 1.84 µs | 0.4× |
+| mixture parameters | 5 000 | 23.3 µs | 90.4 µs | 3.9× |
+
+XLA's vectorised full evaluation is three orders of magnitude cheaper than the Julia
+baseline, so absolute numbers differ, but the structure matches the paper: single-site
+updates are constant in N and the dense parameter moves pay the incremental overhead.
+The priors are standard choices; the paper's exact priors live in its artifact
+(Zenodo 10.5281/zenodo.19080766), not in the text.
 
 Later: `scan` rule for Markov structure; data-dependent `gather` sparsity (the paper's
 `using`); `memo` primitive for latent-independent intermediates; masked fixed-capacity
@@ -153,3 +187,18 @@ data growth (SMC-style); `MixedHMC`; `BarkerMH`.
   back with one sliced apply, with no `lax.cond` on the state.
 - 2026-10-22: `test/infer/test_mcmc.py::test_beta_bernoulli_x64[SA]` fails on
   `develop` before the `sa.py` one-liner as well; not caused by this branch.
+- 2026-10-22: XLA CPU copies a loop-carried buffer on every iteration when the body
+  both updates it in place and reads a value from it that escapes into another carried
+  element (the running total), which made a single-element update O(N) inside a
+  sweep even though the Δ-program itself is O(1). Neither `optimization_barrier`,
+  gather-based reads nor `dynamic_update_slice` help. Sweeps therefore read from a
+  snapshot taken before the loop (`apply(..., read_values=snapshot)`), which is exact
+  when every read of the swept site is at the swept position; the planner reports the
+  sites a signature reads in full (`input_full_reads`) and `DiscreteGibbs` falls back
+  to carried reads for them. Cache writes are deferred to the end of an apply. Single-
+  element updates cost 10–30 ns at any N after this.
+- 2026-10-22: `IncrementalMCMCState.z` is a view of `inc.z`, not a second field: two
+  aliases of one carried array make XLA copy one of them per in-place update.
+- 2026-10-22: `RandomWalk` block (Gaussian drift in unconstrained space) added for the
+  paper's parameter kernels; `IncrementalMCMC` initialises with `init_to_uniform`
+  like HMC (prior samples left the mixture examples in poor modes).
