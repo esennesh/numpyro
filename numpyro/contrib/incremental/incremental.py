@@ -198,24 +198,40 @@ class IncrementalDensity:
         total = sum((jnp.sum(o) for o in outs), start=jnp.zeros(()))
         return IncrementalState(values, cache, total)
 
-    def apply(self, state, change, model_args=(), model_kwargs=None):
-        """Apply ``change``; returns ``(delta, new_state)``."""
+    def apply(self, state, change, model_args=(), model_kwargs=None, read_values=None):
+        """
+        Apply ``change``; returns ``(delta, new_state)``.
+
+        ``read_values`` (default ``state.z``): the site values the program reads. A
+        sweep over distinct elements of one site inside a ``fori_loop`` should pass a
+        snapshot of ``state.z`` taken before the loop so that the carried arrays are
+        only written in the loop body (otherwise XLA CPU copies them every iteration);
+        this is exact when the changed sites are not in :meth:`input_full_reads`.
+        """
         prog = self._compile(change)
         arg_leaves = self.program.flatten_args(model_args, model_kwargs)
-        delta, _, updates = prog.apply(state.z, arg_leaves, state.cache, change)
+        delta, _, updates, change = prog.apply(
+            state.z, arg_leaves, state.cache, change, read_values
+        )
         new_cache = dict(state.cache)
         new_cache.update(updates)
         new_z = apply_change_to_values(state.z, input_deltas(change, self.program))
         return delta, IncrementalState(new_z, new_cache, state.total + delta)
 
-    def apply_delta(self, state, change, model_args=(), model_kwargs=None):
+    def apply_delta(
+        self, state, change, model_args=(), model_kwargs=None, read_values=None
+    ):
         """Only the change in joint log density (no cache update)."""
         prog = self._compile(change)
         arg_leaves = self.program.flatten_args(model_args, model_kwargs)
         delta, factor_deltas = prog.apply_delta(
-            state.z, arg_leaves, state.cache, change
+            state.z, arg_leaves, state.cache, change, read_values
         )
         return delta, factor_deltas
+
+    def input_full_reads(self, change):
+        """Sites whose full value the program for ``change`` reads (not just slices)."""
+        return self._plan(change)[1]["input_full_reads"]
 
     def resync(self, state, model_args=(), model_kwargs=None):
         """Recompute the cache and total from scratch at the current values."""

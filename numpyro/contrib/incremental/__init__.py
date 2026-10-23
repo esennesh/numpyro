@@ -18,6 +18,7 @@ from numpyro.contrib.incremental.adapt import (
     IncrementalMCMC,
     IncrementalMCMCState,
     PotentialBlock,
+    RandomWalk,
 )
 from numpyro.contrib.incremental.delta import Change, Dense, Sliced
 from numpyro.contrib.incremental.density import (
@@ -46,6 +47,7 @@ __all__ = [
     "IncrementalMCMCState",
     "IncrementalState",
     "PotentialBlock",
+    "RandomWalk",
     "SiteMeta",
     "Sliced",
     "check_consistency",

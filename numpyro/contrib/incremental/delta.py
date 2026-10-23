@@ -97,8 +97,12 @@ def gather_rect(x, axes, idxs):
     """Read the rectangular block of ``x`` at ``idxs`` along ``axes`` (layout kept)."""
     x = jnp.asarray(x)
     for a, i in zip(axes, idxs):
-        ix = (slice(None),) * a + (i,)
-        x = x.at[ix].get(mode="promise_in_bounds", unique_indices=True)
+        if i.shape[0] == 1:
+            # dynamic_slice lowers to an in-place-friendly op; a gather does not.
+            x = lax.dynamic_index_in_dim(x, i[0], axis=a, keepdims=True)
+        else:
+            ix = (slice(None),) * a + (i,)
+            x = x.at[ix].get(mode="promise_in_bounds", unique_indices=True)
     return x
 
 
@@ -107,7 +111,14 @@ def scatter_rect(x, axes, idxs, value):
     x = jnp.asarray(x)
     if not axes:
         return jnp.asarray(value)
-    value = jnp.asarray(value)
+    value = jnp.asarray(value, x.dtype)
+    if all(i.shape[0] == 1 for i in idxs):
+        # Single element per sliced axis: a dynamic_update_slice, which XLA updates
+        # in place inside loops (a general scatter may copy the operand).
+        start = [jnp.zeros((), jnp.int32)] * x.ndim
+        for a, i in zip(axes, idxs):
+            start[a] = i[0].astype(jnp.int32)
+        return lax.dynamic_update_slice(x, value, start)
     ix = _index_tuple(x.ndim, axes, idxs)
     if not _contiguous(axes):
         # NumPy advanced indexing moves non-contiguous advanced dims to the front.
