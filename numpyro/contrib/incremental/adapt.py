@@ -36,7 +36,7 @@ from numpyro.contrib.incremental.delta import Change
 from numpyro.contrib.incremental.incremental import IncrementalDensity
 from numpyro.handlers import seed, substitute, trace
 from numpyro.infer.hmc import HMC, hmc
-from numpyro.infer.hmc_gibbs import DiscreteHMCGibbs, HMCGibbs, _wrap_model
+from numpyro.infer.hmc_gibbs import DiscreteHMCGibbs, HMCGibbs
 from numpyro.infer.initialization import init_to_uniform
 from numpyro.infer.mcmc import MCMCKernel
 from numpyro.infer.sa import SA, _sa
@@ -498,7 +498,7 @@ class IncrementalMCMC(MCMCKernel):
           same machinery).
         """
         if isinstance(kernel, DiscreteHMCGibbs):
-            model = _unwrap_model(kernel.inner_kernel)
+            model = kernel.inner_kernel.model
             steps = [
                 (
                     None,
@@ -509,7 +509,7 @@ class IncrementalMCMC(MCMCKernel):
                 (None, kernel.inner_kernel),
             ]
         elif isinstance(kernel, HMCGibbs):
-            model = _unwrap_model(kernel.inner_kernel)
+            model = kernel.inner_kernel.model
             steps = [
                 (tuple(kernel._gibbs_sites), GibbsFn(kernel._gibbs_fn)),
                 (None, kernel.inner_kernel),
@@ -669,13 +669,6 @@ class IncrementalMCMC(MCMCKernel):
         state = self.__dict__.copy()
         state["_sample_fn"] = None
         return state
-
-
-def _unwrap_model(inner_kernel):
-    model = inner_kernel.model
-    if isinstance(model, partial) and model.func is _wrap_model:
-        return model.args[0]
-    return model
 
 
 __all__ = [
