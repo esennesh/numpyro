@@ -7,6 +7,7 @@ from collections import namedtuple
 
 import numpy as np
 
+import jax
 from jax.extend.core import Literal
 import jax.numpy as jnp
 
@@ -25,11 +26,13 @@ from numpyro.contrib.incremental.interpreter import (
 )
 from numpyro.infer.initialization import init_to_sample
 
-IncrementalState = namedtuple("IncrementalState", ["z", "cache", "total"])
+IncrementalState = namedtuple("IncrementalState", ["params", "z", "cache",
+                                                   "total"])
 IncrementalState.__doc__ = """
-State of an incremental density: ``z`` the current latent values (continuous sites
-unconstrained), ``cache`` the cached intermediate values keyed by variable id, and
-``total`` the (diagnostic) running joint log density.
+State of an incremental density: ``params`` the current point-estimated density
+parameters, ``z`` the current latent values (continuous sites unconstrained),
+``cache`` the cached intermediate values keyed by variable id, and ``total`` the
+(diagnostic) running joint log density.
 """
 
 
@@ -73,7 +76,7 @@ class IncrementalDensity:
             raise ValueError("cache must be 'all' or 'plan'.")
         self.cache_mode = cache
         self.model = model
-        self.program, self.init_values = trace_density(
+        self.program, self.init_params, self.init_values = trace_density(
             model,
             model_args,
             model_kwargs,
@@ -97,6 +100,7 @@ class IncrementalDensity:
             self.cache_keys = self._factor_keys
         self._compiled = {}
         self._plans = {}
+        self._cache_evaluator = None
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -155,6 +159,7 @@ class IncrementalDensity:
             if not reads <= self.cache_keys:
                 self.cache_keys = self.cache_keys | reads
                 self._compiled.clear()
+                self._cache_evaluator = None
         return self
 
     def plan_site_changes(self, sites=None, ks=(1,), dense=True):
@@ -190,15 +195,31 @@ class IncrementalDensity:
         return int(sum(np.prod(v.shape) for v in state.cache.values()))
 
     # ------------------------------------------------------------------ API
-    def init(self, values=None, model_args=(), model_kwargs=None):
-        """Evaluate the program from scratch and build the state."""
-        values = dict(self.init_values if values is None else values)
-        inputs = self.program.flatten_inputs(values, model_args, model_kwargs)
-        outs, cache = record_cache(self.program, self.table, inputs, self.cache_keys)
-        total = sum((jnp.sum(o) for o in outs), start=jnp.zeros(()))
-        return IncrementalState(values, cache, total)
+    def init(self, values=None, model_args=(), model_kwargs=None,
+             param_map=None):
+        """Build the state using a reusable JIT evaluator and current parameters.
 
-    def apply(self, state, change, model_args=(), model_kwargs=None, read_values=None):
+        ``param_map`` defaults to the prototype parameters. Parameter values are
+        runtime inputs; their dependent intermediates are recomputed on every call.
+        """
+        param_map = dict(self.init_params if param_map is None else param_map)
+        values = dict(self.init_values if values is None else values)
+        inputs = self.program.flatten_inputs(param_map, values, model_args,
+                                             model_kwargs)
+        if self._cache_evaluator is None:
+            program, table, keys = self.program, self.table, self.cache_keys
+
+            def evaluate(inputs):
+                outs, cache = record_cache(program, table, inputs, keys)
+                total = sum((jnp.sum(o) for o in outs), start=jnp.zeros(()))
+                return cache, total
+
+            self._cache_evaluator = jax.jit(evaluate)
+        cache, total = self._cache_evaluator(inputs)
+        return IncrementalState(param_map, values, cache, total)
+
+    def apply(self, state, change, model_args=(), model_kwargs=None,
+              read_values=None):
         """
         Apply ``change``; returns ``(delta, new_state)``.
 
@@ -211,21 +232,21 @@ class IncrementalDensity:
         prog = self._compile(change)
         arg_leaves = self.program.flatten_args(model_args, model_kwargs)
         delta, _, updates, change = prog.apply(
-            state.z, arg_leaves, state.cache, change, read_values
+            state.params, state.z, arg_leaves, state.cache, change, read_values
         )
         new_cache = dict(state.cache)
         new_cache.update(updates)
         new_z = apply_change_to_values(state.z, input_deltas(change, self.program))
-        return delta, IncrementalState(new_z, new_cache, state.total + delta)
+        return delta, IncrementalState(state.params, new_z, new_cache,
+                                       state.total + delta)
 
-    def apply_delta(
-        self, state, change, model_args=(), model_kwargs=None, read_values=None
-    ):
+    def apply_delta(self, state, change, model_args=(), model_kwargs=None,
+                    read_values=None):
         """Only the change in joint log density (no cache update)."""
         prog = self._compile(change)
         arg_leaves = self.program.flatten_args(model_args, model_kwargs)
         delta, factor_deltas = prog.apply_delta(
-            state.z, arg_leaves, state.cache, change, read_values
+            state.params, state.z, arg_leaves, state.cache, change, read_values
         )
         return delta, factor_deltas
 
@@ -233,9 +254,16 @@ class IncrementalDensity:
         """Sites whose full value the program for ``change`` reads (not just slices)."""
         return self._plan(change)[1]["input_full_reads"]
 
-    def resync(self, state, model_args=(), model_kwargs=None):
-        """Recompute the cache and total from scratch at the current values."""
-        return self.init(state.z, model_args, model_kwargs)
+    def resync(self, state, model_args=(), model_kwargs=None, param_map=None):
+        """Refresh the cache at current latent values, optionally with new parameters.
+
+        Omitted ``param_map`` preserves ``state.params``. Call after an optimizer
+        update before performing further incremental latent updates.
+        """
+        return self.init(
+            state.z, model_args, model_kwargs,
+            state.params if param_map is None else param_map,
+        )
 
     def factor_values(self, state):
         """The cached per-factor log density arrays."""
@@ -329,7 +357,7 @@ def check_consistency(
     for step in range(num_changes):
         change = random_change(inc, rng)
         delta, new_state = inc.apply(state, change, model_args, model_kwargs)
-        fresh = inc.program.eval(new_state.z, model_args, model_kwargs)
+        fresh = inc.program.eval(new_state.params, new_state.z, model_args, model_kwargs)
         cached = inc.factor_values(new_state)
         for name in inc.program.factor_names:
             err = np.max(np.abs(np.asarray(cached[name]) - np.asarray(fresh[name])))

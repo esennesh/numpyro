@@ -9,7 +9,10 @@ from zoo import ZOO
 import jax
 import jax.numpy as jnp
 
+import numpyro
 from numpyro.contrib.incremental import Change, IncrementalDensity
+import numpyro.contrib.incremental.incremental as incremental_module
+import numpyro.distributions as dist
 
 TOL = dict(rtol=1e-4, atol=1e-4)
 
@@ -48,7 +51,7 @@ def _random_changes(inc, rng, n):
 
 
 def _check_state(inc, state, entry):
-    fresh = inc.program.eval(state.z, entry.args, entry.kwargs)
+    fresh = inc.program.eval(state.params, state.z, entry.args, entry.kwargs)
     cached = inc.factor_values(state)
     for name in inc.program.factor_names:
         assert_allclose(cached[name], fresh[name], err_msg=name, **TOL)
@@ -156,3 +159,66 @@ def test_hmm_falls_back_to_dense():
     state = inc.init(model_args=entry.args)
     _, new_state = inc.apply(state, change, entry.args)
     _check_state(inc, new_state, entry)
+
+
+@pytest.mark.parametrize("cache", ["all", "plan"])
+def test_parameter_refresh(cache, monkeypatch):
+    traces = []
+    cache_traces = []
+    record_cache = incremental_module.record_cache
+
+    def counted_record_cache(*args):
+        cache_traces.append(None)
+        return record_cache(*args)
+
+    monkeypatch.setattr(incremental_module, "record_cache", counted_record_cache)
+
+    def model(data):
+        traces.append(None)
+        loc = numpyro.param("loc", jnp.zeros(()))
+        scale = numpyro.param("scale", jnp.ones(()))
+        with numpyro.plate("data", data.shape[0]):
+            z = numpyro.sample("z", dist.Normal(loc, scale))
+            numpyro.sample("obs", dist.Normal(z, scale), obs=data)
+
+    data = jnp.arange(3.0)
+    inc = IncrementalDensity(model, (data,), cache=cache)
+    change = Change.sliced({"z": jnp.array([0.7])}, {"data": jnp.array([1])})
+    inc.plan(change)
+    initial_traces = len(traces)
+    state = inc.init(model_args=(data,))
+    compiled = inc._compile(change)
+    apply = jax.jit(lambda s: inc.apply(s, change, (data,)))
+    delta_only = jax.jit(lambda s: inc.apply_delta(s, change, (data,))[0])
+    for loc in (0.2, 1.5):
+        params = {
+            "loc": jnp.asarray(loc, dtype=inc.init_params["loc"].dtype),
+            "scale": jnp.asarray(1.3, dtype=inc.init_params["scale"].dtype),
+        }
+        state = inc.resync(state, model_args=(data,), param_map=params)
+        assert_allclose(
+            state.total,
+            inc.program.log_density(params, state.z, (data,)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        delta, updated = apply(state)
+        expected = inc.program.log_density(params, updated.z, (data,))
+        assert_allclose(delta, expected - state.total, rtol=1e-5, atol=1e-5)
+        assert_allclose(delta_only(state), delta, rtol=1e-5, atol=1e-5)
+        assert_allclose(updated.total, expected, rtol=1e-5, atol=1e-5)
+        reset = inc.resync(updated, model_args=(data,))
+        for name, value in inc.init_params.items():
+            assert_allclose(reset.params[name], value)
+        assert_allclose(
+            reset.total,
+            inc.program.log_density(inc.init_params, updated.z, (data,)),
+            rtol=1e-5,
+            atol=1e-5,
+        )
+        assert inc._compile(change) is compiled
+        input_ids = {inc.var_id(v) for v in inc.program.jaxpr.jaxpr.invars}
+        assert not input_ids.intersection(state.cache)
+        state = updated
+    assert len(traces) == initial_traces
+    assert len(cache_traces) == 1

@@ -39,7 +39,7 @@ def test_plan_mode_caches_little_for_gmm():
     d_full, _ = full.apply(s_full, change, (y,))
     d_lean, s_lean2 = lean.apply(s_lean, change, (y,))
     assert_allclose(d_full, d_lean, **TOL)
-    fresh = lean.program.eval(s_lean2.z, (y,))
+    fresh = lean.program.eval(s_lean2.params, s_lean2.z, (y,))
     for k, v in lean.factor_values(s_lean2).items():
         assert_allclose(v, fresh[k], err_msg=k, **TOL)
 
@@ -55,7 +55,7 @@ def test_unplanned_signature_raises_and_plan_fixes_it():
     inc.plan(dense_mu)
     state = inc.resync(state, entry.args)
     _, new_state = inc.apply(state, dense_mu, entry.args)
-    fresh = inc.program.eval(new_state.z, entry.args)
+    fresh = inc.program.eval(new_state.params, new_state.z, entry.args)
     assert_allclose(inc.factor_values(new_state)["obs"], fresh["obs"], **TOL)
 
 
@@ -70,7 +70,7 @@ def test_plan_mode_gradients_and_vmap():
         return inc.apply_delta(state, Change.dense(mu=mu), entry.args)[0]
 
     def reference(mu):
-        return inc.program.log_density({**state.z, "mu": mu}, entry.args)
+        return inc.program.log_density(state.params, {**state.z, "mu": mu}, entry.args)
 
     assert_allclose(
         jax.grad(incremental)(mu0 + 0.1), jax.grad(reference)(mu0 + 0.1), **TOL

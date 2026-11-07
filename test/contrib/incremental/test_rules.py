@@ -37,7 +37,7 @@ def test_dense_path_gradient_matches_log_density(model_name, site):
         )[0]
 
     def reference(x):
-        return inc.program.log_density({**state.z, site: x}, entry.args, entry.kwargs)
+        return inc.program.log_density(state.params, {**state.z, site: x}, entry.args, entry.kwargs)
 
     x = x0 + 0.3
     # The reference subtracts two O(100) float32 totals and loses ~1e-3; the
@@ -58,7 +58,7 @@ def test_reduce_sum_delta_rule_is_local():
     tags = inc.tags(change)
     assert tags == {"x": "Sliced", "obs": "Sliced", "tot": "Dense"}
     delta, new_state = inc.apply(state, change, args)
-    fresh = inc.program.eval(new_state.z, args)
+    fresh = inc.program.eval(new_state.params, new_state.z, args)
     assert_allclose(inc.factor_values(new_state)["tot"], fresh["tot"], **TOL)
     # Only a handful of equations run: not the N-sized sum.
     assert inc.num_reexecuted(change) < 20
@@ -83,7 +83,7 @@ def test_reduce_sum_guard_recovers_from_poisoned_cache():
     poisoned = state._replace(cache=cache)
     change = Change.sliced({"x": jnp.array([0.7])}, {"N": 3})
     _, new_state = inc.apply(poisoned, change, args)
-    fresh = inc.program.eval(new_state.z, args)
+    fresh = inc.program.eval(new_state.params, new_state.z, args)
     assert_allclose(new_state.cache[vid], jnp.sum(new_state.z["x"]), **TOL)
     assert_allclose(inc.factor_values(new_state)["tot"], fresh["tot"], **TOL)
 
@@ -94,7 +94,7 @@ def test_custom_jvp_sliced_path_values_and_registry():
     state = inc.init(model_args=entry.args)
     change = Change.sliced({"k": jnp.array([3]), "b": jnp.array([1])}, {"N": 5})
     delta, new_state = inc.apply(state, change, entry.args)
-    fresh = inc.program.eval(new_state.z, entry.args)
+    fresh = inc.program.eval(new_state.params, new_state.z, entry.args)
     for name in ("k", "b", "obs"):
         assert_allclose(inc.factor_values(new_state)[name], fresh[name], **TOL)
     assert inc.tags(change)["k"] == "Sliced"

@@ -107,7 +107,7 @@ def test_explicit_steps_with_sa_and_vectorized_chains():
     inc = kernel.incremental_density
     for chain in range(2):
         z = {k: v[chain] for k, v in state.z.items()}
-        total = inc.program.log_density(z, (y,))
+        total = inc.program.log_density({k: v[chain] for k, v in state.inc.params.items()}, z, (y,))
         assert_allclose(state.inc.total[chain], total, rtol=1e-4, atol=1e-2)
 
 

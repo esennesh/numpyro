@@ -397,18 +397,26 @@ def incrementalize(program, table, signature_change, cache_keys, pullback=False)
     """
     jaxpr = program.jaxpr.jaxpr
     consts = program.jaxpr.consts
-    site_invars = jaxpr.invars[: program.num_site_inputs]
+    param_invars = jaxpr.invars[:program.num_param_inputs]
+    site_invars = jaxpr.invars[
+        program.num_param_inputs:program.num_param_inputs + program.num_site_inputs
+    ]
+    arg_invars = jaxpr.invars[len(param_invars)+len(site_invars):]
     info = {}
 
-    def run(site_values, arg_leaves, cache, change, write_updates, read_values=None):
+    def run(param_values, site_values, arg_leaves, cache, change, write_updates,
+            read_values=None):
         deltas = input_deltas(change, program)
         inputs = {}
         in_deltas = []
+        for name, v in zip(program.param_names, param_invars):
+            inputs[((), v)] = param_values[name]
+            in_deltas.append(SAME)
         read_values = site_values if read_values is None else read_values
         for name, v in zip(program.site_names, site_invars):
             inputs[((), v)] = read_values[name]
             in_deltas.append(deltas.get(name, SAME))
-        for v, a in zip(jaxpr.invars[program.num_site_inputs :], arg_leaves):
+        for v, a in zip(arg_invars, arg_leaves):
             inputs[((), v)] = a
             in_deltas.append(SAME)
         ctx = Context(table, cache, cache_keys, inputs, write_updates, pullback)
@@ -436,7 +444,8 @@ def incrementalize(program, table, signature_change, cache_keys, pullback=False)
         updates = ctx.flush_updates(pending_values)
         return delta, factor_deltas, updates, change
 
-    def apply(site_values, arg_leaves, cache, change, read_values=None):
+    def apply(param_values, site_values, arg_leaves, cache, change,
+              read_values=None):
         """
         Returns ``(delta, factor_deltas, cache_updates, change)``.
 
@@ -447,11 +456,14 @@ def incrementalize(program, table, signature_change, cache_keys, pullback=False)
         place, which would make each element update O(N)). This is exact when the
         changed sites are not read in full (``info["input_full_reads"]``).
         """
-        return run(site_values, arg_leaves, cache, change, True, read_values)
+        return run(param_values, site_values, arg_leaves, cache, change, True,
+                   read_values)
 
-    def apply_delta(site_values, arg_leaves, cache, change, read_values=None):
+    def apply_delta(param_values, site_values, arg_leaves, cache, change,
+                    read_values=None):
         delta, factor_deltas, _, _ = run(
-            site_values, arg_leaves, cache, change, False, read_values
+            param_values, site_values, arg_leaves, cache, change, False,
+            read_values
         )
         return delta, factor_deltas
 
@@ -459,20 +471,24 @@ def incrementalize(program, table, signature_change, cache_keys, pullback=False)
 
 
 def abstract_inputs(program, table):
-    """Abstract site values, argument leaves and a full cache, for planning traces."""
+    """Abstract parameters, sites, arguments and cache for planning traces."""
     jaxpr = program.jaxpr.jaxpr
+    params_abs = dict(zip(program.param_names, (
+        jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype)
+        for v in jaxpr.invars[:program.num_param_inputs]
+    )))
     z_abs = {
         n: jax.ShapeDtypeStruct(m.shape, m.dtype) for n, m in program.sites.items()
     }
     args_abs = [
         jax.ShapeDtypeStruct(v.aval.shape, v.aval.dtype)
-        for v in jaxpr.invars[program.num_site_inputs :]
+        for v in jaxpr.invars[program.num_param_inputs + program.num_site_inputs :]
     ]
     cache_abs = {
         i: jax.ShapeDtypeStruct(key[1].aval.shape, key[1].aval.dtype)
         for key, i in table.ids.items()
     }
-    return z_abs, args_abs, cache_abs
+    return params_abs, z_abs, args_abs, cache_abs
 
 
 def plan(program, table, change, pullback):
@@ -483,6 +499,6 @@ def plan(program, table, change, pullback):
     caller. Also returns the program's ``info``.
     """
     prog = incrementalize(program, table, change, frozenset(), pullback)
-    z_abs, args_abs, cache_abs = abstract_inputs(program, table)
-    jax.eval_shape(prog.apply, z_abs, args_abs, cache_abs, change)
+    params_abs, z_abs, args_abs, cache_abs = abstract_inputs(program, table)
+    jax.eval_shape(prog.apply, params_abs, z_abs, args_abs, cache_abs, change)
     return prog.info["reads"], prog.info
