@@ -4,11 +4,14 @@
 """
 Stage 1: compile a NumPyro model to a deterministic density program.
 
-The density program is a :class:`jax.extend.core.ClosedJaxpr` whose inputs are the
-latent site values (continuous sites in unconstrained space, discrete sites raw) followed
-by the array-valued model arguments, and whose outputs are the per-factor *unsummed*
-``log_prob`` arrays. Jacobian pseudo-factors ``_{name}_log_det`` emitted by
-:func:`numpyro.infer.util._unconstrain_reparam` are attributed to their owner site.
+The density program is a :class:`jax.extend.core.ClosedJaxpr` whose inputs are
+the model parameter-site values (typically continuous tensors passed to an
+optimizer), latent site values (continuous sites in unconstrained space,
+discrete sites raw), and finally the array-valued model arguments, and whose
+outputs are the per-factor *unsummed* ``log_prob`` arrays. Jacobian
+pseudo-factors ``_{name}_log_det`` emitted by
+:func:`numpyro.infer.util._unconstrain_reparam` are attributed to their owner
+site.
 """
 
 from collections import namedtuple
@@ -33,6 +36,32 @@ from numpyro.infer.util import (
     helpful_support_errors,
 )
 
+FactorMeta = namedtuple(
+    "FactorMeta",
+    [
+        "name",
+        "shape",  # shape of the unsummed log_prob array
+        "dtype",
+        "plates",  # tuple of (plate_name, axis) pairs, axis >= 0 into ``shape``
+        "owner",  # the latent site a ``_x_log_det`` factor belongs to, else ``name``
+        "is_observed",
+    ],
+)
+FactorMeta.__doc__ = "Static metadata of one factor (log density output) of a program."
+
+ParamMeta = namedtuple(
+    "ParamMeta",
+    [
+        "name",
+        "cond_indep_stack", # Conditional independence of parameters
+        "dtype",
+        "mutable", # Distinguish params (True) from mutable (False)
+        "scale", # Scaling factor
+        "shape",
+    ],
+)
+ParamMeta.__doc__ = "Static metadata of a parameter or mutable site in a density program."
+
 SiteMeta = namedtuple(
     "SiteMeta",
     [
@@ -47,20 +76,6 @@ SiteMeta = namedtuple(
     ],
 )
 SiteMeta.__doc__ = "Static metadata of a latent sample site in a density program."
-
-FactorMeta = namedtuple(
-    "FactorMeta",
-    [
-        "name",
-        "shape",  # shape of the unsummed log_prob array
-        "dtype",
-        "plates",  # tuple of (plate_name, axis) pairs, axis >= 0 into ``shape``
-        "owner",  # the latent site a ``_x_log_det`` factor belongs to, else ``name``
-        "is_observed",
-    ],
-)
-FactorMeta.__doc__ = "Static metadata of one factor (log density output) of a program."
-
 
 def _is_array_leaf(leaf):
     return isinstance(leaf, (jax.Array, np.ndarray)) or (
@@ -109,27 +124,19 @@ class DensityProgram:
     output order) and :meth:`eval`.
     """
 
-    def __init__(
-        self,
-        jaxpr: ClosedJaxpr,
-        site_names,
-        sites,
-        factor_names,
-        factors,
-        args_tree,
-        args_leaves_static,
-        num_eqns,
-        model=None,
-        deterministic_sites=(),
-    ):
+    def __init__(self, jaxpr: ClosedJaxpr, site_names, sites, factor_names,
+                 factors, param_names, params, args_tree, args_leaves_static,
+                 num_eqns, deterministic_sites=(), model=None):
         self.jaxpr = jaxpr
-        # The model with param/mutable sites frozen, for replays (postprocessing).
+        # The model for replays (postprocessing).
         self.model = model
         self.deterministic_sites = tuple(deterministic_sites)
         self.site_names = tuple(site_names)
         self.sites = sites
         self.factor_names = tuple(factor_names)
         self.factors = factors
+        self.param_names = tuple(param_names)
+        self.params = params
         self._args_tree = args_tree
         # One entry per leaf of (model_args, model_kwargs): the leaf itself when it is
         # static (closed over), or ``None`` when it is a traced program input.
@@ -160,6 +167,13 @@ class DensityProgram:
             if static is None
         ]
 
+    def flatten_params(self, params):
+        """Return the traced leaves of ``params`` in input order."""
+        missing = [name for name in self.param_names if name not in params]
+        if missing:
+            raise ValueError(f"Missing values for parameters/mutables {missing}.")
+        return [jnp.asarray(params[name]) for name in self.param_names]
+
     def flatten_values(self, values):
         """Return the site leaves of ``values`` in input order."""
         missing = [name for name in self.site_names if name not in values]
@@ -167,20 +181,21 @@ class DensityProgram:
             raise ValueError(f"Missing values for sites {missing}.")
         return [jnp.asarray(values[name]) for name in self.site_names]
 
-    def flatten_inputs(self, values, model_args=(), model_kwargs=None):
-        return self.flatten_values(values) + self.flatten_args(model_args, model_kwargs)
+    def flatten_inputs(self, params, values, model_args=(), model_kwargs=None):
+        return self.flatten_params(params) + self.flatten_values(values) +\
+               self.flatten_args(model_args, model_kwargs)
 
     # ------------------------------------------------------------------ eval
-    def eval(self, values, model_args=(), model_kwargs=None):
+    def eval(self, params, values, model_args=(), model_kwargs=None):
         """Evaluate every factor from scratch; returns ``{factor: log_prob array}``."""
         outs = jaxpr_as_fun(self.jaxpr)(
-            *self.flatten_inputs(values, model_args, model_kwargs)
+            *self.flatten_inputs(params, values, model_args, model_kwargs)
         )
         return dict(zip(self.factor_names, outs))
 
-    def log_density(self, values, model_args=(), model_kwargs=None):
+    def log_density(self, params, values, model_args=(), model_kwargs=None):
         """Joint log density (sum over all factors) from scratch."""
-        factors = self.eval(values, model_args, model_kwargs)
+        factors = self.eval(params, values, model_args, model_kwargs)
         return sum((jnp.sum(v) for v in factors.values()), start=jnp.zeros(()))
 
     # ------------------------------------------------------------------ info
@@ -227,8 +242,10 @@ def trace_density(
     :param bool validate: whether distribution argument/sample validation is active
         while tracing. Off by default: validation only adds masking equations.
     :param rng_key: key for the prototype trace (defaults to ``random.key(0)``).
-    :return: ``(program, init_values)`` where ``init_values`` maps every latent site to
-        its initial stored value (unconstrained for continuous sites).
+    :return: ``(program, param_values, init_values)`` where ``param_values``
+        maps every param or mutable site to its initial stored value and
+        ``init_values`` maps every latent site to its initial stored value
+        (unconstrained for continuous sites).
     """
     model_kwargs = {} if model_kwargs is None else dict(model_kwargs)
     model_args = tuple(model_args)
@@ -240,15 +257,13 @@ def trace_density(
         ).get_trace(*model_args, **model_kwargs)
     _check_supported(prototype_trace)
 
-    frozen = {
-        k: site["value"]
-        for k, site in prototype_trace.items()
-        if site["type"] in ("param", "mutable")
-    }
-    frozen_model = _substitute_default_key(substitute(model, data=frozen))
+    reseeded_model = _substitute_default_key(model)
 
     continuous, discrete, init_values, transforms = [], [], {}, {}
+    param_values = {}
     for name, site in prototype_trace.items():
+        if site["type"] in ("mutable", "param"):
+            param_values[site["name"]] = site["value"]
         if site["type"] != "sample" or site["is_observed"]:
             continue
         if site["fn"].support.is_discrete:
@@ -260,6 +275,7 @@ def trace_density(
                 t = biject_to(site["fn"].support)
             transforms[name] = t
             init_values[name] = t.inv(site["value"])
+    param_names = param_values.keys()
     site_names = continuous + discrete
     if not site_names:
         raise ValueError("The model has no latent sample sites.")
@@ -276,16 +292,19 @@ def trace_density(
 
     captured = {}
 
-    def density(site_leaves, traced_leaves):
+    def density(param_leaves, site_leaves, traced_leaves):
+        params_dict = dict(zip(param_names, param_leaves))
         values = dict(zip(site_names, site_leaves))
         cont_values = {k: values[k] for k in continuous}
         disc_values = {k: values[k] for k in discrete}
         args, kwargs = rebuild_args(traced_leaves)
         substituted = substitute(
-            frozen_model, substitute_fn=partial(_unconstrain_reparam, cont_values)
+            reseeded_model,
+            substitute_fn=partial(_unconstrain_reparam, cont_values)
         )
+        substituted = substitute(substituted, data=disc_values)
         log_probs, model_trace = compute_log_probs(
-            substituted, args, kwargs, disc_values, sum_log_prob=False
+            substituted, args, kwargs, params_dict, sum_log_prob=False
         )
         # Keep only Python-level metadata; the trace itself holds tracers.
         captured["factor_meta"] = {
@@ -300,6 +319,7 @@ def trace_density(
 
     with validation_enabled(validate):
         closed_jaxpr, out_shape = jax.make_jaxpr(density, return_shape=True)(
+            list(param_values.values()),
             [jnp.asarray(init_values[n]) for n in site_names], traced_arg_leaves
         )
     factor_names = list(out_shape.keys())
@@ -307,6 +327,37 @@ def trace_density(
     # Dict outputs flatten in sorted-key order; make the factor order explicit.
     factor_names = sorted(factor_names)
     assert len(out_leaves) == len(factor_names) == len(closed_jaxpr.jaxpr.outvars)
+
+    factors = {}
+    for name, leaf in zip(factor_names, out_leaves):
+        is_observed, plates = captured["factor_meta"][name]
+        owner = name
+        if name.startswith("_") and name.endswith("_log_det"):
+            candidate = name[1 : -len("_log_det")]
+            if candidate in site_names:
+                owner = candidate
+        factors[name] = FactorMeta(
+            name=name,
+            shape=tuple(leaf.shape),
+            dtype=leaf.dtype,
+            plates=plates,
+            owner=owner,
+            is_observed=is_observed,
+        )
+
+    params = {}
+    for name in param_names:
+        site, value = prototype_trace[name], param_values[name]
+        if site["type"] == "mutable":
+            params[name] = ParamMeta(name=name, cond_indep_stack=None,
+                                     dtype=None, mutable=True, scale=None,
+                                     shape=None)
+        else:
+            params[name] = ParamMeta(
+                name=name, cond_indep_stack=site["cond_indep_stack"],
+                dtype=jnp.result_type(value), mutable=False,
+                scale=site["scale"], shape=tuple(jnp.shape(value))
+            )
 
     sites = {}
     for name in site_names:
@@ -327,38 +378,23 @@ def trace_density(
             support_size=support_size,
         )
 
-    factors = {}
-    for name, leaf in zip(factor_names, out_leaves):
-        is_observed, plates = captured["factor_meta"][name]
-        owner = name
-        if name.startswith("_") and name.endswith("_log_det"):
-            candidate = name[1 : -len("_log_det")]
-            if candidate in sites:
-                owner = candidate
-        factors[name] = FactorMeta(
-            name=name,
-            shape=tuple(leaf.shape),
-            dtype=leaf.dtype,
-            plates=plates,
-            owner=owner,
-            is_observed=is_observed,
-        )
-
     program = DensityProgram(
         jaxpr=closed_jaxpr,
         site_names=site_names,
         sites=sites,
         factor_names=factor_names,
         factors=factors,
+        param_names=param_names,
+        params=params,
         args_tree=args_tree,
         args_leaves_static=args_leaves_static,
         num_eqns=_count_eqns(closed_jaxpr.jaxpr),
-        model=frozen_model,
+        model=reseeded_model,
         deterministic_sites=[
             k for k, s in prototype_trace.items() if s["type"] == "deterministic"
         ],
     )
-    return program, init_values
+    return program, param_values, init_values
 
 
 def _count_eqns(jaxpr):

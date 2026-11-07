@@ -14,7 +14,7 @@ import numpyro.distributions as dist
 from numpyro.infer.util import log_density
 
 
-def reference_log_density(entry, program, values):
+def reference_log_density(entry, program, params, values):
     """Joint log density of the stored values computed without the program."""
     constrained = {}
     log_det = 0.0
@@ -27,32 +27,38 @@ def reference_log_density(entry, program, values):
             x = meta.transform(u)
             constrained[name] = x
             log_det = log_det + jnp.sum(meta.transform.log_abs_det_jacobian(u, x))
-    lp, _ = log_density(entry.model, entry.args, entry.kwargs, constrained)
+    model = numpyro.handlers.substitute(entry.model, data=params)
+    lp, _ = log_density(model, entry.args, entry.kwargs, constrained)
     return lp + log_det
 
 
 def test_eval_matches_reference(zoo_entry):
     name, entry = zoo_entry
-    program, init_values = trace_density(entry.model, entry.args, entry.kwargs)
-    total = program.log_density(init_values, entry.args, entry.kwargs)
-    expected = reference_log_density(entry, program, init_values)
+    program, param_values, init_values = trace_density(entry.model, entry.args,
+                                                       entry.kwargs)
+    total = program.log_density(param_values, init_values, entry.args,
+                                entry.kwargs)
+    expected = reference_log_density(entry, program, param_values, init_values)
     assert_allclose(total, expected, rtol=1e-5, atol=1e-5)
 
 
 def test_eval_is_jittable(zoo_entry):
     name, entry = zoo_entry
-    program, init_values = trace_density(entry.model, entry.args, entry.kwargs)
-    f = jax.jit(lambda v, a: program.log_density(v, a, entry.kwargs))
+    program, param_values, init_values = trace_density(entry.model, entry.args,
+                                                       entry.kwargs)
+    f = jax.jit(lambda p, v, a: program.log_density(p, v, a, entry.kwargs))
     assert_allclose(
-        f(init_values, entry.args),
-        program.log_density(init_values, entry.args, entry.kwargs),
+        f(param_values, init_values, entry.args),
+        program.log_density(param_values, init_values, entry.args,
+                            entry.kwargs),
         rtol=1e-6,
     )
 
 
 def test_gmm_metadata():
     entry = ZOO["gmm"]
-    program, init_values = trace_density(entry.model, entry.args, entry.kwargs)
+    program, param_values, init_values = trace_density(entry.model, entry.args,
+                                                       entry.kwargs)
     n = entry.args[0].shape[0]
     assert set(program.site_names) == {"w", "s", "mu", "z"}
     assert program.sites["z"].plates == (("data", 0),)
@@ -69,13 +75,13 @@ def test_gmm_metadata():
     assert program.factors["z"].shape == (n,)
     assert program.factors["mu"].shape == (3,)
     # Factor outputs are plain arrays in factor order.
-    out = program.eval(init_values, entry.args, entry.kwargs)
+    out = program.eval(param_values, init_values, entry.args, entry.kwargs)
     assert list(out) == list(program.factor_names)
 
 
 def test_nested_metadata():
     entry = ZOO["nested"]
-    program, _ = trace_density(entry.model, entry.args, entry.kwargs)
+    program, _, _ = trace_density(entry.model, entry.args, entry.kwargs)
     assert program.sites["a"].plates == (("M", 0),)
     assert program.sites["a"].shape == (3, 1)
     assert program.sites["b"].plates == (("M", 0), ("N", 1))
@@ -84,7 +90,7 @@ def test_nested_metadata():
 
 def test_static_arg_is_closed_over():
     entry = ZOO["static_arg"]
-    program, _ = trace_density(entry.model, entry.args, entry.kwargs)
+    program, _, _ = trace_density(entry.model, entry.args, entry.kwargs)
     assert program.num_arg_inputs == 1  # only ``y`` is traced
     with pytest.raises(ValueError, match="do not match"):
         program.flatten_args(entry.args, {})
@@ -92,8 +98,10 @@ def test_static_arg_is_closed_over():
 
 def test_validation_off_shrinks_program():
     entry = ZOO["gmm"]
-    p_off, _ = trace_density(entry.model, entry.args, entry.kwargs, validate=False)
-    p_on, _ = trace_density(entry.model, entry.args, entry.kwargs, validate=True)
+    p_off, _, _ = trace_density(entry.model, entry.args, entry.kwargs,
+                                validate=False)
+    p_on, _, _ = trace_density(entry.model, entry.args, entry.kwargs,
+                               validate=True)
     assert p_off.num_eqns < p_on.num_eqns
 
 
@@ -120,7 +128,7 @@ def test_params_are_frozen():
         x = numpyro.sample("x", dist.Normal(loc, 1.0))
         numpyro.sample("obs", dist.Normal(x, 1.0), obs=y)
 
-    program, init_values = trace_density(model, (jnp.zeros(2),))
+    program, param_values, init_values = trace_density(model, (jnp.zeros(2),))
     assert program.site_names == ("x",)
-    lp = program.log_density(init_values, (jnp.zeros(2),))
+    lp = program.log_density(param_values, init_values, (jnp.zeros(2),))
     assert jnp.isfinite(lp)
