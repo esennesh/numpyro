@@ -43,7 +43,7 @@ class IncrementalDensity:
     Usage::
 
         inc = IncrementalDensity(model, (data,))
-        state = inc.init()
+        state = inc.init(model_args=(data,))
         delta, state = inc.apply(state, Change.sliced({"z": z_i}, {"data": i}), (data,))
 
     :param model: a NumPyro model.

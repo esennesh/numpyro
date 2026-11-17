@@ -5,7 +5,8 @@
 Incremental density computation (EXPERIMENTAL).
 
 Compiles a NumPyro model to a deterministic density program (a jaxpr whose inputs are
-the latent site values and whose outputs are the per-factor unsummed log densities) and
+parameter/mutable values, latent site values and array-valued model arguments, and
+whose outputs are the per-factor unsummed log densities) and
 incrementalizes that program against typed change descriptions, following Zaiser et
 al., *Incremental Computation for Efficient Programmable Inference in Probabilistic
 Programs* (PLDI 2026, doi:10.1145/3808316).
