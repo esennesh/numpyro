@@ -349,14 +349,64 @@ Incremental density computation
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``numpyro.contrib.incremental`` compiles a model to a deterministic *density program*
-(a jaxpr whose inputs are the latent site values and whose outputs are the per-factor
-unsummed log densities) and incrementalizes that program against typed *change
-descriptions*, following [1]. A :class:`~numpyro.contrib.incremental.Change` replaces
+(a jaxpr whose inputs are parameter/mutable values, latent site values and array-valued
+model arguments, and whose outputs are the per-factor unsummed log densities) and
+incrementalizes that program against typed *change descriptions*, following [1]. A :class:`~numpyro.contrib.incremental.Change` replaces
 whole sites (``Change.dense``) or a rectangular block of plate elements
 (``Change.sliced``); applying it re-executes only the equations the change reaches,
 reading unchanged intermediate values from a cache, so that updating one element of a
 plated site costs its Markov blanket rather than the whole model. The emitted program
 is an ordinary JAX function and composes with ``jit``, ``vmap`` and ``grad``.
+
+Parameter updates and compilation reuse
+---------------------------------------
+
+Parameter and mutable sites are runtime inputs, stored in
+:class:`~numpyro.contrib.incremental.IncrementalState` separately from latent values
+and cached intermediates. Continuous latent values are unconstrained; parameter
+values are supplied as model-site values. Parameters remain fixed during incremental
+latent updates and cannot be targeted by ``Change``.
+
+``init(..., param_map=None)`` uses the prototype parameters captured when the density
+was constructed. ``resync(state, param_map=None)`` instead preserves ``state.params``.
+After an optimizer changes parameters, pass the new mapping to ``resync`` to rebuild
+parameter-dependent intermediates before performing another latent update. Replacing
+``state.params`` alone would leave those intermediates stale.
+
+For example, the new mapping below represents the result of an optimizer step:
+
+.. doctest::
+
+    >>> import jax.numpy as jnp
+    >>> import numpyro
+    >>> import numpyro.distributions as dist
+    >>> from numpyro.contrib.incremental import IncrementalDensity
+    >>> def model(data):
+    ...     loc = numpyro.param("loc", jnp.zeros(()))
+    ...     z = numpyro.sample("z", dist.Normal(loc, 1.0))
+    ...     numpyro.sample("obs", dist.Normal(z, 1.0), obs=data)
+    >>> data = jnp.asarray(0.5)
+    >>> inc = IncrementalDensity(model, (data,))
+    >>> params = dict(inc.init_params)
+    >>> state = inc.init(model_args=(data,), param_map=params)
+    >>> new_params = {"loc": params["loc"] + 0.1}
+    >>> state = inc.resync(state, model_args=(data,), param_map=new_params)
+    >>> state = inc.resync(state, model_args=(data,))  # Keeps new_params.
+
+Construct ``IncrementalDensity`` once outside the training loop. It traces the model
+once and retains incremental programs by change signature. Initialization and resync
+use a reusable JIT cache evaluator: fresh values reuse compilation when input pytree
+structures, shapes, dtypes and weak types match. Only derived numerical values are
+refreshed; parameter inputs themselves are not entries in the numerical cache.
+
+With ``cache="plan"``, register change signatures using ``plan`` or
+``plan_site_changes`` before initialization. Expanding the cache plan invalidates the
+cached programs and cache evaluator; resync existing states after expanding the plan.
+Array-valued model arguments must be supplied again to initialization, resync and
+incremental updates.
+
+Kernel adapters
+---------------
 
 :class:`~numpyro.contrib.incremental.IncrementalMCMC` runs existing kernels as block
 steps on the incremental density: ``HMC``/``NUTS``/``SA`` on continuous blocks (their
@@ -417,3 +467,50 @@ trace_density
 check_consistency
 -----------------
 .. autofunction:: numpyro.contrib.incremental.check_consistency
+
+
+DensityProgram
+--------------
+.. autoclass:: numpyro.contrib.incremental.DensityProgram
+    :members:
+
+IncrementalState
+----------------
+.. autoclass:: numpyro.contrib.incremental.IncrementalState
+
+IncrementalMCMCState
+--------------------
+.. autoclass:: numpyro.contrib.incremental.IncrementalMCMCState
+
+Block
+-----
+.. autoclass:: numpyro.contrib.incremental.Block
+    :members:
+
+PotentialBlock
+--------------
+.. autoclass:: numpyro.contrib.incremental.PotentialBlock
+
+Dense
+-----
+.. autoclass:: numpyro.contrib.incremental.Dense
+
+Sliced
+------
+.. autoclass:: numpyro.contrib.incremental.Sliced
+
+FactorMeta
+----------
+.. autoclass:: numpyro.contrib.incremental.FactorMeta
+
+SiteMeta
+--------
+.. autoclass:: numpyro.contrib.incremental.SiteMeta
+
+ParamMeta
+---------
+.. autoclass:: numpyro.contrib.incremental.density.ParamMeta
+
+incrementalize
+--------------
+.. autofunction:: numpyro.contrib.incremental.incrementalize
